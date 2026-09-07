@@ -50,9 +50,12 @@ class Notifier:
         if not self.config.ntfy_topic:
             return
         url = f"{self.config.ntfy_server.rstrip('/')}/{self.config.ntfy_topic}"
+        # HTTP headers are latin-1 only; keep the Title ASCII-safe and let the
+        # emoji come from Tags (ntfy renders tag names as icons). The body is UTF-8.
+        safe_title = title.encode("ascii", "replace").decode("ascii")
         req = urllib.request.Request(
             url, data=body.encode("utf-8"), method="POST",
-            headers={"Title": title, "Priority": priority, "Tags": tags},
+            headers={"Title": safe_title, "Priority": priority, "Tags": tags},
         )
         try:
             urllib.request.urlopen(req, timeout=10)
@@ -61,7 +64,7 @@ class Notifier:
 
     def action_needed(self, title: str, body: str) -> None:
         log.warning("ACTION NEEDED: %s — %s", title, body)
-        self._ntfy(f"⚠️ {title}", body, priority="high", tags="warning")
+        self._ntfy(title, body, priority="high", tags="warning,rotating_light")
 
     def fyi(self, title: str, body: str) -> None:
         log.info("FYI: %s — %s", title, body)

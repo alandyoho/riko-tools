@@ -213,7 +213,7 @@ class Monitor:
         planned = _planned_food_today(st, self.tz_offset)
         allowed, why = self._remediation_allowed(8.0, planned)
         if not allowed:
-            self.n.action_needed("Pump stalled — not auto-fixing",
+            self.n.action_needed("Pump stalled - not auto-fixing",
                                  f"{name}. Holding off ({why}). Run `riko unclog` yourself "
                                  f"if the cat needs the meal.")
             return
