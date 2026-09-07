@@ -474,35 +474,68 @@ class Riko:
 
     # --- clock ----------------------------------------------------------
     async def unclog(self, *, pulses: int = 2, pulse_s: float = 2.0,
-                     refeed: tuple[float, float] | None = None) -> RikoStatus:
-        """Recover from a 'pumper: Stuck' (code 70 / 'Nozzle clogged') stall.
+                     resume: bool = True, settle_s: float = 3.0,
+                     verify_s: float = 25.0) -> RikoStatus:
+        """Recover from a 'pumper: Stuck' stall (code 70 / app's "Nozzle clogged").
 
-        Observed 2026-09-07: the pump wasn't clogged, it had lost prime. Two short
-        pump runs pushed the air out and the next feed completed. The app's own
-        retry *resumes* the suspended feed, which doesn't re-prime, so it fails again.
+        The pump isn't clogged, it has lost prime: water drains back toward the
+        tank while the feeder is idle, and small pumps can't pull air. Two short
+        runs push the air out and the meal completes.
 
-        Sequence: end any suspended feed -> pulse the pump -> verify idle ->
-        optionally re-issue the meal as (food_g, water_g).
+        Deliberately does NOT call feedCtrl END. Observed 2026-09-07: END puts the
+        device into SERVING with param=1 -- it dumps whatever was already ground
+        into the bowl and extends the tray. Re-feeding after that double-doses the
+        cat (94 g delivered against a 32 g target), and the tray bouncing in and
+        out is the gap the cat gets under. Instead we prime while the device is
+        still suspended with the tray in, then RESUME so the firmware finishes the
+        meal it already started -- it knows what it has and hasn't dispensed, and
+        we can't ask (curWeight is cached, not live; see riko_trace.py).
+
+        Returns the status after recovery. Raises if the device isn't in a state
+        this can safely handle.
         """
         st = await self.status()
-        if st.state in (FeederState.SUSPENDED, FeederState.FAULT):
-            log.info("ending suspended feed (state=%s, param=%s)", st.state.name, st.state_param)
-            await self.feed_control(FeedCtrl.END)
-            await asyncio.sleep(2)
+
+        if st.state == FeederState.IDLE:
+            log.info("device already idle; priming only")
+        elif st.state == FeederState.SUSPENDED:
+            code = ERROR_CODES.get(st.state_param, f"code {st.state_param}")
+            if st.state_param not in (0, 70):
+                raise RuntimeError(
+                    f"suspended for '{code}', not a pump stall -- not touching it")
+            log.info("suspended on '%s'; priming with the tray where it is", code)
+        else:
+            raise RuntimeError(
+                f"device is {st.state.name}; unclog only handles IDLE or SUSPENDED")
+
+        was_suspended = st.state == FeederState.SUSPENDED
+
         for i in range(pulses):
-            log.info("pump pulse %d/%d", i + 1, pulses)
+            log.info("pump prime %d/%d", i + 1, pulses)
             await self.dispense_water(True)
             await asyncio.sleep(pulse_s)
             await self.dispense_water(False)
             await asyncio.sleep(1.5)
-        st = await self.status()
-        if st.state != FeederState.IDLE:
-            raise RuntimeError(f"device not idle after unclog: {st.state.name} param={st.state_param}")
-        if refeed:
-            food, water = refeed
-            log.info("re-issuing meal %sg/%sg", food, water)
-            await self.feed(food, water)
-        return st
+        await asyncio.sleep(settle_s)
+
+        if was_suspended and resume:
+            log.info("resuming the suspended meal")
+            await self.feed_control(FeedCtrl.RESUME)
+            deadline = time.monotonic() + verify_s
+            while time.monotonic() < deadline:
+                await asyncio.sleep(3)
+                st = await self.status()
+                if st.state in (FeederState.PREPARING, FeederState.SERVING):
+                    log.info("meal resumed (state=%s)", st.state.name)
+                    return st
+                if st.state == FeederState.SUSPENDED:
+                    code = ERROR_CODES.get(st.state_param, f"code {st.state_param}")
+                    raise RuntimeError(
+                        f"still suspended after priming ('{code}'). The pump may "
+                        f"genuinely be failing, or the tank needs reseating.")
+            log.warning("resume sent but no state change within %.0fs", verify_s)
+
+        return await self.status()
 
     async def sync_time(self, source: int = 1) -> Any:
         """Ask the device to re-sync its clock. 0 = from Neakasa backend, 1 = from Aliyun."""
@@ -578,8 +611,9 @@ async def _cli() -> int:
     pm = sub.add_parser("pump"); pm.add_argument("onoff", choices=["on", "off"])
     gr = sub.add_parser("grinder"); gr.add_argument("onoff", choices=["on", "off"])
     uc = sub.add_parser("unclog", help="recover from a code-70 pump stall")
-    uc.add_argument("--feed", nargs=2, type=float, metavar=("FOOD_G", "WATER_G"),
-                    help="re-issue this meal after priming")
+    uc.add_argument("--no-resume", action="store_true",
+                    help="prime the pump only; don't resume the suspended meal")
+    uc.add_argument("--pulses", type=int, default=2, help="pump priming runs (default 2)")
     sub.add_parser("synctime")
     tz = sub.add_parser("tz"); tz.add_argument("zone", type=int, nargs="?",
         help="e.g. -4 for EDT, -5 for EST; defaults to tz_offset from config")
@@ -633,8 +667,11 @@ async def _cli() -> int:
         elif args.cmd == "grinder":
             print(await r.dispense_food(args.onoff == "on"))
         elif args.cmd == "unclog":
-            st = await r.unclog(refeed=tuple(args.feed) if args.feed else None)
-            print(f"ok: state={st.state.name}")
+            try:
+                st = await r.unclog(pulses=args.pulses, resume=not args.no_resume)
+                print(f"ok: state={st.state.name} param={st.state_param}")
+            except RuntimeError as exc:
+                print(f"unclog: {exc}", file=sys.stderr); return 1
         elif args.cmd == "synctime":
             print(await r.sync_time(1))
         elif args.cmd == "tz":
