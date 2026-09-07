@@ -475,26 +475,55 @@ class Riko:
     # --- clock ----------------------------------------------------------
     async def unclog(self, *, pulses: int = 2, pulse_s: float = 2.0,
                      resume: bool = True, settle_s: float = 3.0,
-                     verify_s: float = 25.0) -> RikoStatus:
-        """Recover from a 'pumper: Stuck' stall (code 70 / app's "Nozzle clogged").
+                     verify_s: float = 25.0,
+                     journal: list[dict[str, Any]] | None = None) -> RikoStatus:
+        """Recover from a 'pumper: Stuck' stall (code 70 / the app's "Nozzle clogged").
 
-        The pump isn't clogged, it has lost prime: water drains back toward the
-        tank while the feeder is idle, and small pumps can't pull air. Two short
-        runs push the air out and the meal completes.
+        The pump isn't clogged, it has lost prime: water drains back toward the tank
+        while the feeder is idle, and small pumps can't pull air. Short pump runs
+        push the air out.
 
         Deliberately does NOT call feedCtrl END. Observed 2026-09-07: END puts the
-        device into SERVING with param=1 -- it dumps whatever was already ground
-        into the bowl and extends the tray. Re-feeding after that double-doses the
-        cat (94 g delivered against a 32 g target), and the tray bouncing in and
-        out is the gap the cat gets under. Instead we prime while the device is
-        still suspended with the tray in, then RESUME so the firmware finishes the
-        meal it already started -- it knows what it has and hasn't dispensed, and
-        we can't ask (curWeight is cached, not live; see riko_trace.py).
+        device into SERVING with param=1 -- it dumps whatever was already ground into
+        the bowl and extends the tray. Re-feeding after that double-doses the cat
+        (94 g delivered against a 32 g target), and the tray bouncing in and out is
+        the gap the cat gets under. Priming while the device is still suspended keeps
+        the tray retracted, and RESUME lets the firmware finish the meal it started --
+        it knows what it has and hasn't dispensed, and we can't ask (curWeight is
+        cached, not live; see riko_trace.py).
 
-        Returns the status after recovery. Raises if the device isn't in a state
-        this can safely handle.
+        WHAT'S UNPROVEN: waterProvide has never been observed to move water. Every
+        test so far ran with the tray EXTENDED, where the firmware accepts the call
+        (ReturnCode 0) and silently declines to pump -- including the 11:52 recovery,
+        where END had already extended the tray before the pulses fired. It may work
+        from a real stall, where the tray is retracted and the device is not in
+        freshness protection, but that state has proved impossible to reach
+        deliberately. The pulses are kept because the app's own retry (a plain
+        RESUME) has failed repeatedly in the past, so resume alone is not sufficient.
+
+        Every step records a full status snapshot into `journal` (and the log) so the
+        next real stall settles this instead of producing more ambiguity.
         """
-        st = await self.status()
+        j = journal if journal is not None else []
+
+        async def note(step: str) -> RikoStatus:
+            st = await self.status()
+            entry = {
+                "step": step,
+                "t": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "state": st.state.name,
+                "param": st.state_param,
+                "bowl_in": st.bowl_in,
+                "scale_g": st.scale_g,
+                "food_in_bowl_g": st.food_in_bowl_g,
+                "water_level": st.water_level.name,
+            }
+            j.append(entry)
+            log.info("unclog[%s] state=%s param=%s bowl_in=%s scale=%sg",
+                     step, entry["state"], entry["param"], entry["bowl_in"], entry["scale_g"])
+            return st
+
+        st = await note("before")
 
         if st.state == FeederState.IDLE:
             log.info("device already idle; priming only")
@@ -511,12 +540,14 @@ class Riko:
         was_suspended = st.state == FeederState.SUSPENDED
 
         for i in range(pulses):
-            log.info("pump prime %d/%d", i + 1, pulses)
+            log.info("pump prime %d/%d (%.1fs)", i + 1, pulses, pulse_s)
             await self.dispense_water(True)
             await asyncio.sleep(pulse_s)
             await self.dispense_water(False)
             await asyncio.sleep(1.5)
+            await note(f"after_pulse_{i + 1}")
         await asyncio.sleep(settle_s)
+        await note("after_priming")
 
         if was_suspended and resume:
             log.info("resuming the suspended meal")
@@ -524,7 +555,7 @@ class Riko:
             deadline = time.monotonic() + verify_s
             while time.monotonic() < deadline:
                 await asyncio.sleep(3)
-                st = await self.status()
+                st = await note("after_resume")
                 if st.state in (FeederState.PREPARING, FeederState.SERVING):
                     log.info("meal resumed (state=%s)", st.state.name)
                     return st
@@ -535,7 +566,7 @@ class Riko:
                         f"genuinely be failing, or the tank needs reseating.")
             log.warning("resume sent but no state change within %.0fs", verify_s)
 
-        return await self.status()
+        return await note("final")
 
     async def sync_time(self, source: int = 1) -> Any:
         """Ask the device to re-sync its clock. 0 = from Neakasa backend, 1 = from Aliyun."""
@@ -667,11 +698,24 @@ async def _cli() -> int:
         elif args.cmd == "grinder":
             print(await r.dispense_food(args.onoff == "on"))
         elif args.cmd == "unclog":
+            journal: list[dict[str, Any]] = []
             try:
-                st = await r.unclog(pulses=args.pulses, resume=not args.no_resume)
+                st = await r.unclog(pulses=args.pulses, resume=not args.no_resume,
+                                    journal=journal)
                 print(f"ok: state={st.state.name} param={st.state_param}")
             except RuntimeError as exc:
-                print(f"unclog: {exc}", file=sys.stderr); return 1
+                print(f"unclog: {exc}", file=sys.stderr)
+                return 1
+            finally:
+                if journal:
+                    path = cfg.capture_dir / f"unclog_{time.strftime('%Y%m%d_%H%M%S')}.json"
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(json.dumps(journal, indent=2))
+                    print(f"\njournal ({len(journal)} snapshots) -> {path}")
+                    print(f"{'step':<18} {'state':<12} {'param':>5} {'bowl':>5} {'scale':>6}")
+                    for e in journal:
+                        print(f"{e['step']:<18} {e['state']:<12} {e['param']:>5} "
+                              f"{str(e['bowl_in']):>5} {e['scale_g']:>5}g")
         elif args.cmd == "synctime":
             print(await r.sync_time(1))
         elif args.cmd == "tz":
