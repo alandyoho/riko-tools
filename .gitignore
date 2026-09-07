@@ -1,0 +1,7 @@
+.venv/
+.env
+.riko-session.json
+riko.toml
+riko_capture/
+__pycache__/
+.DS_Store
