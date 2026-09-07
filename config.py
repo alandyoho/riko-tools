@@ -76,6 +76,9 @@ class Config:
     # runtime
     poll_seconds: int = 15
 
+    # notify config passthrough ([notify] table), read by notify.py
+    _notify: dict = field(default_factory=dict, repr=False)
+
     # provenance, for debugging
     source_file: Path | None = field(default=None, repr=False)
 
@@ -137,11 +140,15 @@ def load(path: str | Path | None = None) -> Config:
         if (val := os.environ.get(env_name)) is not None:
             merged.setdefault(section, {})[key] = val
 
+    notify_tbl = merged.get("notify", {}) if isinstance(merged.get("notify"), dict) else {}
+
     flat: dict[str, Any] = {}
     for section in ("account", "device", "paths", "runtime"):
         flat.update(merged.get(section, {}))
-    # tolerate top-level keys too
-    flat.update({k: v for k, v in merged.items() if not isinstance(v, dict)})
+    # tolerate top-level scalar keys too (skip known section tables)
+    _sections = {"account", "device", "paths", "runtime", "notify"}
+    flat.update({k: v for k, v in merged.items()
+                 if not isinstance(v, dict) and k not in _sections})
 
     known = {f.name for f in fields(Config)}
     if unknown := set(flat) - known - {"source_file"}:
@@ -159,7 +166,7 @@ def load(path: str | Path | None = None) -> Config:
         else:
             kwargs[key] = val
 
-    cfg = Config(**kwargs, source_file=cfg_path)
+    cfg = Config(**kwargs, source_file=cfg_path, _notify=notify_tbl)
 
     if not 0 <= cfg.bowl_grams <= 200:
         raise ConfigError(f"bowl_grams must be 0-200 (the firmware's range), got {cfg.bowl_grams}")
