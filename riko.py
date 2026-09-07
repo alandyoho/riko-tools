@@ -466,6 +466,12 @@ class Riko:
         whether foodLvl/waterLvl 'Insufficient' is a sensor problem or a threshold one."""
         return await self.invoke("getVoltage", chanIdx=int(channel))
 
+    async def udp_channel(self, on: bool) -> Any:
+        """Toggle the device's UDP command channel. Undocumented; with it off the
+        device has no open TCP or UDP ports at all (nmap, 2026-09-07). The guess is
+        that this opens a local listener, which would give us a cloud-free path."""
+        return await self.invoke("udpCmd", bOnOff=1 if on else 0)
+
     async def read_config(self, cfg_file: str) -> Any:
         return await self.invoke("cfgRead", cfgFile=cfg_file)
 
@@ -641,6 +647,8 @@ async def _cli() -> int:
     fc = sub.add_parser("feedctrl"); fc.add_argument("action", choices=["pause", "resume", "end"])
     pm = sub.add_parser("pump"); pm.add_argument("onoff", choices=["on", "off"])
     gr = sub.add_parser("grinder"); gr.add_argument("onoff", choices=["on", "off"])
+    ud = sub.add_parser("udp", help="toggle the device's UDP command channel")
+    ud.add_argument("onoff", choices=["on", "off"])
     uc = sub.add_parser("unclog", help="recover from a code-70 pump stall")
     uc.add_argument("--no-resume", action="store_true",
                     help="prime the pump only; don't resume the suspended meal")
@@ -716,6 +724,8 @@ async def _cli() -> int:
                     for e in journal:
                         print(f"{e['step']:<18} {e['state']:<12} {e['param']:>5} "
                               f"{str(e['bowl_in']):>5} {e['scale_g']:>5}g")
+        elif args.cmd == "udp":
+            print(await r.udp_channel(args.onoff == "on"))
         elif args.cmd == "synctime":
             print(await r.sync_time(1))
         elif args.cmd == "tz":
