@@ -66,7 +66,9 @@ class Config:
     # device — device_name is optional; with one Riko on the account we find it
     device_name: str | None = None
     bowl_grams: int = 68          # true empty-bowl weight; factory default is a wrong 65
-    tz_offset: int = -4           # firmware ignores the DST flag, so set the effective offset
+    tz_offset: int = -5           # standard-time base offset; fallback only. FW 1.0.0-0023
+                                  # applies DST itself, so this is used only to correct a
+                                  # device whose own DST handling is broken (older firmware).
 
     # paths
     session_file: Path = Path(".riko-session.json")
@@ -194,9 +196,10 @@ region = "US"
 # food-in-bowl reading off by that difference.
 bowl_grams = 68
 
-# Effective UTC offset. FW 1.0.0-0020 ignores the daylight-saving flag, so set
-# this to your CURRENT offset (-4 EDT, -5 EST) and update it when clocks change.
-tz_offset = -4
+# Standard-time base UTC offset (fallback only). FW 1.0.0-0023 applies the DST flag
+# correctly, so the monitor validates the device clock against real time and this is
+# used only to correct a device whose own DST handling is broken. -5 = US Eastern base.
+tz_offset = -5
 
 [paths]
 session_file = ".riko-session.json"

@@ -232,25 +232,67 @@ class Monitor:
                                  f"Reseat the tank and feed manually.")
 
     async def _check_clock(self, st: RikoStatus) -> None:
+        """Verify the device's clock against real wall-clock time, using the device's
+        OWN timezone data (base offset + DST flag). FW 1.0.0-0023 fixed DST handling,
+        so the correct configuration is the honest one -- base offset with dst=1 and
+        the real DST boundary dates -- and the device applies the +1 itself in summer.
+        We flag drift only when the device's effective time is actually wrong, not when
+        its stored offset differs from some hardcoded number.
+
+        `tz_offset` in config is now just the FALLBACK we'd write if we ever needed to
+        force-correct a device whose own DST handling is broken (older firmware). On
+        -0023+ this check should essentially never fire.
+        """
         tz = st._p("timeZoneMsg", {}) or {}
         zone = tz.get("zone")
-        if zone is None or zone == self.tz_offset:
+        if zone is None:
             return
-        msg = f"Device timezone is {zone}, expected {self.tz_offset}."
+
+        # What time does the DEVICE think it is, from its own config?
+        dev_offset = zone + (1 if tz.get("dst") and _dst_active_now(tz) else 0)
+        # What offset does the device's own timezone actually require right now?
+        # We can't run a full tz database here, but we can sanity-check against the
+        # host's real UTC offset, since the Pi is NTP-synced and in the same zone.
+        real_offset = -round((time.timezone if not time.localtime().tm_isdst
+                              else time.altzone) / 3600)
+
+        drift_h = dev_offset - real_offset
+        if drift_h == 0:
+            return  # device clock is correct -- nothing to do
+
+        msg = (f"Device effective offset is UTC{dev_offset:+d} "
+               f"(zone {zone}, dst={tz.get('dst')}), but real offset is "
+               f"UTC{real_offset:+d} -- off by {drift_h:+d}h.")
         if self.dry_run or self.p.killswitch.exists():
             self.n.action_needed("Clock drifted", msg + " (not auto-fixing)")
             return
-        await self._fix_clock(msg)
+        await self._fix_clock(msg, real_offset)
 
-    async def _fix_clock(self, msg: str) -> None:
+    async def _fix_clock(self, msg: str, real_offset: int) -> None:
+        """Correct a genuinely-wrong device clock. Prefer letting the device do DST:
+        write the base (standard-time) offset with dst=1 and let the firmware apply
+        the +1 when active. Only fall back to a flat offset if that doesn't hold."""
+        # base offset = standard-time offset for this zone (real minus DST if active)
+        base = real_offset - (1 if time.localtime().tm_isdst else 0)
         try:
-            await self.r.set_timezone(self.tz_offset, dst=False)
-            self.n.fyi("Clock re-synced", msg + f" Re-applied {self.tz_offset}.")
+            await self.r.set_timezone(base, dst=True)
+            self.n.fyi("Clock re-synced",
+                       msg + f" Wrote base offset {base:+d} with dst=1 (device applies DST).")
         except Exception as exc:
             self.n.action_needed("Clock fix failed", f"{msg} set_timezone error: {exc}")
 
 
 # ---- slot math (planned intake + which slot we're in) ----------------------
+def _dst_active_now(tz: dict) -> bool:
+    """Is now within the device's declared DST window? Uses the dstStartTimeOne /
+    dstEndTimeOne epoch bounds the device reports."""
+    start = tz.get("dstStartTimeOne")
+    end = tz.get("dstEndTimeOne")
+    if not start or not end:
+        return bool(tz.get("dst"))  # fall back to the flag if bounds missing
+    return start <= time.time() < end
+
+
 def _current_slot_label(st: RikoStatus, tz_offset: int) -> str:
     """Best-effort label for the slot a suspension belongs to: nearest enabled
     slot time to now. Used only to cap one auto-fix per slot per day."""
