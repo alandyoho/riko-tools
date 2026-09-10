@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import sqlite3
 import time
@@ -69,6 +70,10 @@ class Store:
             ts INTEGER, day TEXT, slot TEXT, kind TEXT, result TEXT)""")
         self.db.execute("""CREATE TABLE IF NOT EXISTS seen_errors(
             ts INTEGER, code INTEGER, module TEXT)""")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS settings(
+            key TEXT PRIMARY KEY, value TEXT, ts INTEGER)""")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS setting_changes(
+            ts INTEGER, key TEXT, old TEXT, new TEXT)""")
         self.db.commit()
 
     def log_feed(self, state: str, param: int, note: str = "") -> None:
@@ -79,6 +84,21 @@ class Store:
     def record_remediation(self, slot: str, kind: str, result: str) -> None:
         self.db.execute("INSERT INTO remediations VALUES (?,?,?,?,?)",
                         (int(time.time()), _today(), slot, kind, result))
+        self.db.commit()
+
+    def get_setting(self, key: str) -> str | None:
+        row = self.db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return row[0] if row else None
+
+    def put_setting(self, key: str, value: str) -> None:
+        self.db.execute("INSERT INTO settings VALUES (?,?,?) ON CONFLICT(key) "
+                        "DO UPDATE SET value=excluded.value, ts=excluded.ts",
+                        (key, value, int(time.time())))
+        self.db.commit()
+
+    def record_setting_change(self, key: str, old: str, new: str) -> None:
+        self.db.execute("INSERT INTO setting_changes VALUES (?,?,?,?)",
+                        (int(time.time()), key, old, new))
         self.db.commit()
 
     def remediations_today(self, kind: str | None = None) -> int:
@@ -148,6 +168,7 @@ class Monitor:
         self._check_levels(st)
         await self._check_state(st)
         await self._check_clock(st)
+        self._check_config_drift(st)
 
     async def _handle_unreachable(self, exc: Exception) -> None:
         now = time.time()
@@ -231,6 +252,45 @@ class Monitor:
                                  f"unclog on slot {slot} didn't take: {exc}. "
                                  f"Reseat the tank and feed manually.")
 
+    def _check_config_drift(self, st: RikoStatus) -> None:
+        """Notify when a device setting changes.
+
+        Added after the bowl tare silently reverted from 68 g back to the factory 65 g
+        on 2026-09-09, coinciding with a Neakasa app update — and nothing told us. The
+        correction had been in place for two days. An owner who fixes a setting should
+        find out when something puts it back.
+
+        Notify-only by design. Auto-reverting would mean fighting the app in a loop,
+        and we don't know which side "wins" or why. Surfacing it lets a human decide.
+
+        Changes you make yourself will also notify. That's intentional: a confirmation
+        that a schedule edit landed is useful, and it means an unexpected change stands
+        out against a familiar pattern.
+        """
+        watched = {
+            "bowl tare": _fmt(st.bowl_tare_g),
+            "schedule": _fmt([(s.hhmm, s.food_g, s.water_g, s.enabled) for s in st.schedule]),
+            "default feed": _fmt(st._p("defFdCfg", {})),
+            "freshness": _fmt(st._p("freshMgrCfg", {})),
+            "child lock": _fmt(st._p("childLockOnOff")),
+            "food sound": _fmt(st._p("feedAudCfg", {})),
+        }
+        for key, new in watched.items():
+            old = self.store.get_setting(key)
+            if old is None:
+                self.store.put_setting(key, new)   # first run: establish the baseline
+                continue
+            if old == new:
+                continue
+            self.store.put_setting(key, new)
+            self.store.record_setting_change(key, old, new)
+            log.warning("setting changed: %s: %s -> %s", key, old, new)
+            self.n.action_needed(
+                f"Setting changed: {key}",
+                f"{key} went from {old} to {new}.\n\n"
+                f"If that wasn't you, something else changed it — the app has been seen "
+                f"reverting the bowl tare to the factory value after an update.")
+
     async def _check_clock(self, st: RikoStatus) -> None:
         """Verify the device's clock against real wall-clock time, using the device's
         OWN timezone data (base offset + DST flag). FW 1.0.0-0023 fixed DST handling,
@@ -283,6 +343,15 @@ class Monitor:
 
 
 # ---- slot math (planned intake + which slot we're in) ----------------------
+def _fmt(value: Any) -> str:
+    """Stable string form of a setting, so trivial dict ordering doesn't look like drift."""
+    if isinstance(value, dict):
+        return json.dumps(value, sort_keys=True, separators=(",", ":"))
+    if isinstance(value, (list, tuple)):
+        return json.dumps(value, separators=(",", ":"), default=str)
+    return str(value)
+
+
 def _dst_active_now(tz: dict) -> bool:
     """Is now within the device's declared DST window? Uses the dstStartTimeOne /
     dstEndTimeOne epoch bounds the device reports."""
