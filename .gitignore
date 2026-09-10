@@ -6,3 +6,4 @@ riko_capture/
 __pycache__/
 .DS_Store
 neakasa_decompiled/
+key-extraction-plan.md
