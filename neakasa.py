@@ -1,243 +1,206 @@
 #!/usr/bin/env python3
 """
-neakasa.py — talk to Neakasa's OWN backend (usapi.neakasapet.com), separate from
-the Aliyun IoT channel that riko.py uses.
+neakasa.py — client for Neakasa's OWN backend, where the intake ledger lives.
 
-This is where the intake ledger lives: per-meal planned vs actual grams, failure
-records with reason codes, and the cat's eat sessions — none of which crosses the
-Aliyun channel. See the captured `/api/feeder/record` response, 2026-09-07.
+This is the second of the two clouds the Riko uses. riko.py covers the Aliyun IoT
+channel (device control and state). This covers usapi.neakasapet.com / us.neakasa.com,
+which holds the data the device channel never carries:
 
-WHAT'S KNOWN (from intercepting the iOS app, 2026-09-07):
-  * Login is POST /api/login/user with {account, password, ...} where password is
-    a plain md5 hex of the real password. Returns login_token + user_info.
-  * The ledger is GET /api/feeder/record with a token/uid/sign header triple.
-  * The `sign` header does NOT cover the query params on /feeder/record: a captured
-    sign kept working after start_time was changed. So sign is either fixed or
-    covers only some stable field.
+  * per-meal planned vs actual grams
+  * failure records with reason codes
+  * eat sessions ("ate 34 g, 0 g left") — the only measure of what the cat consumed
+  * the cat profile and food database
 
-WHAT'S UNKNOWN / THE OPEN TEST:
-  * The login request also carries `sign` and a pre-login `token`, computed by the
-    app with a key we can't extract (iOS). This script tests whether login enforces
-    them: run with --login-sign / --login-token captured from the app, and also
-    without, and see which succeeds. If login works WITHOUT a valid sign, we can
-    authenticate from scratch with just email + md5(password) and the whole ledger
-    API becomes self-sufficient. If it doesn't, we fall back to pasting a captured
-    ledger token into config (still read-only-useful, but the token expires).
+PREVIOUSLY BLOCKED, NOW NOT
+Every request here needs three app-computed headers: `sign`, `uid` and `token`. I spent
+a long time trying to extract the keys from the iOS app (Flutter, AES ciphertext, no
+luck) before realising the open-source neakasa-litterbox-sdk already ships them,
+extracted from the Android build. The schemes:
 
-Nothing here writes to the device. Read-only.
+    sign  = base64(HMAC-SHA256(app_secret, app_key + timestamp)).upper()
+    uid   = base64(AES-CBC-NoPadding(user_id, BOOT_KEY, BOOT_IV))
+    token = base64(AES-CBC-NoPadding("<userToken>@<epoch_ms>", aesKey, aesIv))
+
+That last one is why the server once told us "token does not contain the @ sign" — the
+plaintext really is `userToken@timestamp`. Password is md5(md5(plaintext)), double.
+
+Rather than copy those constants here, this module imports them from the installed
+SDK. It's the SDK's work, it stays current if the SDK updates, and it keeps this file
+honest about where the values came from.
 
 USAGE
-    # test login (needs captured sign/token headers to try the "with" case)
-    python3 neakasa.py login --sign 'ZgmN...=' --token '45hd...='
-    python3 neakasa.py login            # no sign/token — does the bare login work?
+    from neakasa import NeakasaBackend
+    async with NeakasaBackend(email, password) as nb:
+        led = await nb.ledger(device_name, days=2)
+        nb.print_ledger(led)
 
-    # read the ledger with a captured header triple (from mitmproxy)
-    python3 neakasa.py ledger --token 'Bzjf...==' --uid 'TMe8...==' --sign '69gi...=' \\
-        --device WL03002G26270010566 --user 400133257 --days 7
-
-Credentials for login come from RIKO config ([account] email/password) or
---account / --password.
+    python3 neakasa.py ledger --device WL0300... --days 2
+    python3 neakasa.py intake --device WL0300... --days 7
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
+import asyncio
 import json
 import sys
 import time
-import urllib.parse
-import urllib.request
 from typing import Any
 
-BASE = "https://usapi.neakasapet.com"
-APPID = "32711645"
-APP_VERSION = "203060001"
-PRODUCT_ID = "a123nCqsrQm3vEbt"   # from the captured login body
-UA = "Neakasa/203060001 CFNetwork/3860.700.1 Darwin/25.6.0"
+try:
+    from neakasa_litterbox_sdk import NeakasaClient, Region
+except ImportError as exc:  # pragma: no cover
+    sys.exit(f"Missing dependency ({exc}). Try: pip install neakasa-litterbox-sdk")
+
+# fail_reason.reason values seen in the wild
+FAIL_REASON = {0: "ok", 1: "pump stall (nozzle)"}
 
 
-def md5_hex(s: str) -> str:
-    return hashlib.md5(s.encode()).hexdigest()
+class NeakasaBackend:
+    """Authenticated access to Neakasa's app backend."""
+
+    def __init__(self, email: str, password: str, *, region: str = "US") -> None:
+        self._email = email
+        self._password = password
+        self._region = region
+        self._client = NeakasaClient(email=email, password=password,
+                                     region=Region[region])
+        self._login: Any = None
+
+    async def __aenter__(self) -> "NeakasaBackend":
+        await self._client.__aenter__()
+        self._login = await self._client.login()
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        await self._client.__aexit__(*exc)
+
+    # --- auth -------------------------------------------------------------
+    @property
+    def user_id(self) -> int:
+        return self._login.user_info.ali_user_id
+
+    async def _get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Issue an authenticated GET via the SDK's own transport.
+
+        Delegating rather than hand-rolling the headers. The SDK implements two
+        distinct schemes and they must not be mixed: pre-login requests carry
+        `appId` + `sign`, while authenticated ones replace those with `uid` + `token`
+        and put the HMAC in `request-id`. Sending both at once gets a bare
+        `code=1001 SystemError` with no hint as to why. The server also derives the
+        user from the `uid` header, so no `user_id` parameter is sent, and every
+        value goes as a string.
+        """
+        return await self._client._authenticated_get(          # noqa: SLF001
+            path,
+            {k: str(v) for k, v in params.items()},
+            context=path,
+        )
+
+    # --- endpoints --------------------------------------------------------
+    async def ledger(self, device_name: str, *, days: int = 1,
+                     start: int | None = None, end: int | None = None) -> dict[str, Any]:
+        """Feeding records + eat sessions + cat profile for a time range."""
+        now = int(time.time())
+        return await self._get("/feeder/record", {
+            "data_type": 0,
+            "device_name": device_name,
+            "start_time": start if start is not None else now - days * 86400,
+            "end_time": end if end is not None else now,
+            "bind_status": 1,
+        })
+
+    # --- presentation -----------------------------------------------------
+    @staticmethod
+    def print_ledger(data: dict[str, Any]) -> None:
+        feeds = data.get("feed_list", [])
+        eats = data.get("eat_list", [])
+        print(f"\n{len(feeds)} feed record(s)")
+        print(f"  {'time':<17} {'way':<7} {'food':>11} {'water':>12}  result")
+        for f in feeds:
+            t = time.strftime("%m-%d %H:%M", time.localtime(f["feed_time"]))
+            food = f"{f['feed_weight']}/{f['plan_feed_weight']}g"
+            water = f"{f['water_weight']}/{f['plan_water_weight']}g"
+            if f["status"] == 1:
+                res = "ok"
+            else:
+                try:
+                    reason = json.loads(f.get("fail_reason", "{}")).get("reason", 0)
+                except ValueError:
+                    reason = 0
+                res = f"FAILED ({FAIL_REASON.get(reason, reason)})"
+            print(f"  {t:<17} {f['way']:<7} {food:>11} {water:>12}  {res}")
+
+        if eats:
+            print(f"\n{len(eats)} eat session(s)")
+            for e in eats:
+                s = time.strftime("%m-%d %H:%M", time.localtime(e["start_time"]))
+                mins = (e["end_time"] - e["start_time"]) / 60
+                print(f"  {s}  {mins:>4.0f} min   ate {e['eat_weight']}g, "
+                      f"{e['left_weight']}g left")
+        else:
+            print("\nNo eat sessions recorded.")
+            print("  (These only appear if the bowl is left undisturbed after serving —")
+            print("   lifting it to weigh cancels the measurement.)")
+
+        NeakasaBackend.print_intake(data)
+
+    @staticmethod
+    def print_intake(data: dict[str, Any]) -> None:
+        """Summarise delivered vs planned and what the cat actually ate."""
+        served = [f for f in data.get("feed_list", []) if f["status"] == 1]
+        failed = [f for f in data.get("feed_list", []) if f["status"] != 1]
+        if served:
+            food = sum(f["feed_weight"] for f in served)
+            plan = sum(f["plan_feed_weight"] for f in served)
+            water = sum(f["water_weight"] for f in served)
+            wplan = sum(f["plan_water_weight"] for f in served)
+            print(f"\nDelivered (device's own figures): {food}g food of {plan}g planned, "
+                  f"{water}g water of {wplan}g planned")
+        if failed:
+            print(f"Failed feeds: {len(failed)}")
+        eats = data.get("eat_list", [])
+        if eats:
+            print(f"Measured intake: {sum(e['eat_weight'] for e in eats)}g "
+                  f"across {len(eats)} session(s)")
+            print("  Note: each session is a single sample ~10 min after serving, so "
+                  "anything eaten later isn't counted.")
 
 
-def _request(method: str, path: str, *, headers: dict[str, str],
-             body: bytes | None = None, query: dict[str, Any] | None = None) -> dict[str, Any]:
-    url = BASE + path
-    if query:
-        url += "?" + urllib.parse.urlencode(query)
-    req = urllib.request.Request(url, data=body, method=method, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            raw = resp.read()
-    except urllib.error.HTTPError as exc:
-        raw = exc.read()
-        print(f"HTTP {exc.code}", file=sys.stderr)
-    try:
-        return json.loads(raw)
-    except ValueError:
-        return {"_raw": raw.decode("utf-8", "replace")}
-
-
-def login(account: str, password: str, *, sign: str | None,
-          token: str | None) -> dict[str, Any]:
-    """POST /api/login/user. sign/token are the app-computed headers; pass them to
-    test the 'with valid headers' case, omit to test whether they're enforced."""
-    body_obj = {
-        "system_number": "iPhone18,1",
-        "app_version": "2.3.6",
-        "product_id": PRODUCT_ID,
-        "password": md5_hex(password),
-        "system": 1,
-        "account": account,
-        "type": 3,
-        "system_version": "26.6.1",
-    }
-    body = json.dumps(body_obj).encode()
-    ts = str(int(time.time()))
-    headers = {
-        "content-type": "application/json",
-        "appid": APPID,
-        "request-id": ts,
-        "uid": "",
-        "version": APP_VERSION,
-        "timestamp": ts,
-        "accept": "*/*",
-        "brand": "iPhone",
-        "accept-language": "en",
-        "user-agent": UA,
-        "model": "iPhone18,1",
-    }
-    if token is not None:
-        headers["token"] = token
-    if sign is not None:
-        headers["sign"] = sign
-    return _request("POST", "/api/login/user", headers=headers, body=body)
-
-
-def ledger(*, token: str, uid: str, sign: str, device: str, user: int,
-           start: int, end: int) -> dict[str, Any]:
-    ts = str(int(time.time()))
-    headers = {
-        "content-type": "application/x-www-form-urlencoded;charset=utf-8",
-        "appid": APPID,
-        "request-id": ts,
-        "uid": uid,
-        "version": APP_VERSION,
-        "timestamp": ts,
-        "accept": "*/*",
-        "brand": "iPhone",
-        "accept-language": "en",
-        "token": token,
-        "user-agent": UA,
-        "model": "iPhone18,1",
-        "sign": sign,
-    }
-    query = {
-        "data_type": 0, "device_name": device, "start_time": start,
-        "user_id": user, "bind_status": 1, "end_time": end,
-    }
-    return _request("GET", "/api/feeder/record", headers=headers, query=query)
-
-
-REASON = {0: "ok", 1: "pump stall / nozzle"}  # extend as we see more
-
-
-def print_ledger(data: dict[str, Any]) -> None:
-    d = data.get("data", {})
-    feeds = d.get("feed_list", [])
-    eats = d.get("eat_list", [])
-    print(f"\n{len(feeds)} feed record(s):")
-    print(f"  {'time':<20} {'way':<7} {'food':>10} {'water':>11} {'status':<8}")
-    for f in feeds:
-        t = time.strftime("%Y-%m-%d %H:%M", time.localtime(f["feed_time"]))
-        food = f"{f['feed_weight']}/{f['plan_feed_weight']}g"
-        water = f"{f['water_weight']}/{f['plan_water_weight']}g"
-        st = "ok" if f["status"] == 1 else "FAILED"
-        try:
-            reason = json.loads(f.get("fail_reason", "{}")).get("reason", 0)
-        except ValueError:
-            reason = 0
-        note = "" if st == "ok" else f" ({REASON.get(reason, reason)})"
-        print(f"  {t:<20} {f['way']:<7} {food:>10} {water:>11} {st}{note}")
-    if eats:
-        print(f"\n{len(eats)} eat session(s):")
-        for e in eats:
-            s = time.strftime("%H:%M", time.localtime(e["start_time"]))
-            en = time.strftime("%H:%M", time.localtime(e["end_time"]))
-            dur = (e["end_time"] - e["start_time"]) / 60
-            print(f"  {s}-{en} ({dur:.0f} min): ate {e['eat_weight']}g, {e['left_weight']}g left")
-    # over-delivery check
-    served = [f for f in feeds if f["status"] == 1]
-    if served:
-        tot = sum(f["feed_weight"] + f["water_weight"] for f in served)
-        plan = sum(f["plan_feed_weight"] + f["plan_water_weight"] for f in served)
-        print(f"\nledger totals (device's own figures): {tot}g delivered vs {plan}g planned")
-
-
-def main() -> int:
-    ap = argparse.ArgumentParser(description="Neakasa backend client (read-only)")
-    sub = ap.add_subparsers(dest="cmd", required=True)
-
-    lg = sub.add_parser("login", help="test whether login works, with or without app headers")
-    lg.add_argument("--account"); lg.add_argument("--password")
-    lg.add_argument("--sign", default=None, help="app-computed sign header (omit to test enforcement)")
-    lg.add_argument("--token", default=None, help="app-computed pre-login token (omit to test enforcement)")
-
-    ld = sub.add_parser("ledger", help="read the feeding ledger with a captured token triple")
-    ld.add_argument("--token", required=True)
-    ld.add_argument("--uid", required=True)
-    ld.add_argument("--sign", required=True)
-    ld.add_argument("--device", required=True)
-    ld.add_argument("--user", type=int, required=True)
-    ld.add_argument("--days", type=int, default=1, help="how many days back (default 1)")
-    ld.add_argument("--raw", action="store_true", help="dump raw JSON")
-
+async def _main() -> int:
+    ap = argparse.ArgumentParser(description="Neakasa app-backend client")
+    ap.add_argument("cmd", choices=["ledger", "intake", "raw"])
+    ap.add_argument("--device", required=True, help="device_name, e.g. WL0300...")
+    ap.add_argument("--days", type=int, default=1)
+    ap.add_argument("--email"); ap.add_argument("--password")
+    ap.add_argument("--region", default="US", choices=["US", "EU", "AP"])
     args = ap.parse_args()
 
-    if args.cmd == "login":
-        account, password = args.account, args.password
-        if not account or not password:
-            try:
-                from config import load as load_config
-                cfg = load_config(); cfg.require_credentials()
-                account = account or cfg.email
-                password = password or cfg.password
-            except Exception:
-                pass
-        if not account or not password:
-            print("need --account and --password (or RIKO config)", file=sys.stderr)
-            return 2
-        print(f"login as {account}, md5(pw)={md5_hex(password)[:8]}…, "
-              f"sign={'yes' if args.sign else 'OMITTED'}, token={'yes' if args.token else 'OMITTED'}")
-        resp = login(account, password, sign=args.sign, token=args.token)
-        code = resp.get("code")
-        if code == 0:
-            info = resp.get("data", {}).get("user_info", {})
-            print(f"  SUCCESS — code 0, ali_user_id={info.get('ali_user_id')}, "
-                  f"login_count={info.get('login_count')}")
-            print("  (if sign was OMITTED and this succeeded, login doesn't enforce it)")
-        else:
-            print(f"  code={code} message={resp.get('message')!r}")
-            print("  (rejected — login likely enforces the sign/token headers)")
-        return 0
+    email, password = args.email, args.password
+    if not (email and password):
+        try:
+            from config import load as load_config
+            cfg = load_config(); cfg.require_credentials()
+            email, password = email or cfg.email, password or cfg.password
+        except Exception:
+            pass
+    if not (email and password):
+        print("need --email/--password or a riko config", file=sys.stderr)
+        return 2
 
-    if args.cmd == "ledger":
-        now = int(time.time())
-        start = now - args.days * 86400
-        resp = ledger(token=args.token, uid=args.uid, sign=args.sign,
-                      device=args.device, user=args.user, start=start, end=now)
-        if args.raw:
-            print(json.dumps(resp, indent=2))
-            return 0
-        if resp.get("code") != 0:
-            print(f"code={resp.get('code')} message={resp.get('message')!r}", file=sys.stderr)
-            print("token may have expired — re-capture from the app", file=sys.stderr)
-            return 1
-        print_ledger(resp)
-        return 0
+    async with NeakasaBackend(email, password, region=args.region) as nb:
+        data = await nb.ledger(args.device, days=args.days)
+        if args.cmd == "raw":
+            print(json.dumps(data, indent=2))
+        elif args.cmd == "intake":
+            nb.print_intake(data)
+        else:
+            nb.print_ledger(data)
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(asyncio.run(_main()))
+    except KeyboardInterrupt:
+        pass
