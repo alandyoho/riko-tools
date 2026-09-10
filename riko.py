@@ -21,7 +21,7 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import IntEnum
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -192,6 +192,39 @@ class RikoStatus:
     def _p(self, key: str, default: Any = None) -> Any:
         v = self.raw.get(key, default)
         return v.get("value", v) if isinstance(v, dict) and "value" in v else v
+
+    def reported_at(self, key: str) -> float | None:
+        """Unix seconds when the device last reported this property.
+
+        Every property in the Aliyun response carries a `time` field in epoch
+        milliseconds. This matters most for bowlStatus: the weight is a cached
+        value the device refreshes only on physical bowl removal/insertion and
+        during a feed, so a reading can be hours old with nothing to indicate it.
+        """
+        v = self.raw.get(key)
+        if isinstance(v, dict) and isinstance(v.get("time"), (int, float)):
+            return v["time"] / 1000.0
+        return None
+
+    def age_of(self, key: str) -> float | None:
+        """Seconds since the device last reported this property."""
+        ts = self.reported_at(key)
+        return None if ts is None else max(0.0, time.time() - ts)
+
+    @property
+    def weight_age_s(self) -> float | None:
+        """How stale the bowl weight is. None if the device didn't say."""
+        return self.age_of("bowlStatus")
+
+    def weight_is_fresh(self, max_age_s: float = 120.0) -> bool:
+        """True if the bowl weight was sampled recently enough to act on.
+
+        Anything older is a cached value from the last time the bowl was
+        physically moved or a meal was served -- it says nothing about what is
+        in the bowl now.
+        """
+        age = self.weight_age_s
+        return age is not None and age <= max_age_s
 
     @property
     def state(self) -> FeederState:
@@ -523,6 +556,7 @@ class Riko:
                 "scale_g": st.scale_g,
                 "food_in_bowl_g": st.food_in_bowl_g,
                 "water_level": st.water_level.name,
+                "weight_age_s": round(st.weight_age_s) if st.weight_age_s is not None else None,
             }
             j.append(entry)
             log.info("unclog[%s] state=%s param=%s bowl_in=%s scale=%sg",
@@ -643,6 +677,25 @@ async def _cli() -> int:
     b = sub.add_parser("bowl"); b.add_argument("action", choices=["retract", "extend"])
     fr = sub.add_parser("freshness"); fr.add_argument("onoff", choices=["on", "off"])
     v = sub.add_parser("voltage"); v.add_argument("channel", choices=[c.name.lower() for c in VoltageChannel])
+    sch = sub.add_parser("schedule", help="view or edit the feeding schedule")
+    schsub = sch.add_subparsers(dest="schedule_cmd", required=True)
+    schsub.add_parser("show", help="list every slot")
+    ss = schsub.add_parser("set", help="change one slot")
+    ss.add_argument("slot", type=int, help="slot number as shown by `schedule show` (1-based)")
+    ss.add_argument("--time", help="HH:MM, 24-hour")
+    ss.add_argument("--food", type=float, help="grams of food (0-60)")
+    ss.add_argument("--water", type=float, help="grams of water (0-600)")
+    sa = schsub.add_parser("set-all", help="change every enabled slot at once")
+    sa.add_argument("--food", type=float, help="grams of food (0-60)")
+    sa.add_argument("--water", type=float, help="grams of water (0-600)")
+    se = schsub.add_parser("enable"); se.add_argument("slot", type=int)
+    sd = schsub.add_parser("disable"); sd.add_argument("slot", type=int)
+
+    df = sub.add_parser("defaults", help="show or set defFdCfg (used by manual feeds)")
+    df.add_argument("--food", type=float, help="grams of food")
+    df.add_argument("--water", type=float, help="grams of water")
+    df.add_argument("--soak", type=int, help="rehydration minutes (0-30)")
+
     sub.add_parser("watch")
     fc = sub.add_parser("feedctrl"); fc.add_argument("action", choices=["pause", "resume", "end"])
     pm = sub.add_parser("pump"); pm.add_argument("onoff", choices=["on", "off"])
@@ -677,7 +730,17 @@ async def _cli() -> int:
         if args.cmd == "status":
             s = await r.status()
             print(f"state={s.state.name} param={s.state_param}")
-            print(f"bowl_in={s.bowl_in} scale={s.scale_g}g tare={s.bowl_tare_g}g food_in_bowl={s.food_in_bowl_g}g")
+            age = s.weight_age_s
+            if age is None:
+                stamp = ""
+            elif age < 90:
+                stamp = f"  [weighed {age:.0f}s ago]"
+            elif age < 5400:
+                stamp = f"  [weighed {age/60:.0f} min ago]"
+            else:
+                stamp = f"  [weighed {age/3600:.1f} h ago — STALE]"
+            print(f"bowl_in={s.bowl_in} scale={s.scale_g}g tare={s.bowl_tare_g}g "
+                  f"food_in_bowl={s.food_in_bowl_g}g{stamp}")
             print(f"food={s.food_level.name} water={s.water_level.name} battery={s.battery_pct}% desiccant={s.desiccant_days_left}d fw={s.firmware}")
             d = s.default_feed
             print(f"default: {d.food_g}g food / {d.water_g}g water (1:{d.ratio:.1f}) soak {d.soak_min}min")
@@ -699,6 +762,81 @@ async def _cli() -> int:
             await r.set_freshness(args.onoff == "on"); print("ok")
         elif args.cmd == "voltage":
             print(await r.read_voltage(VoltageChannel[args.channel.upper()]))
+        elif args.cmd == "schedule":
+            slots = (await r.status()).schedule
+            if not slots:
+                print("no schedule reported by the device", file=sys.stderr); return 1
+
+            def show(slots: list[FeedSlot]) -> None:
+                print(f"{'#':>2}  {'time':<6} {'food':>6} {'water':>7}  state")
+                for n, sl in enumerate(slots, 1):
+                    state = "on" if sl.enabled else "OFF"
+                    if not sl.day_enabled:
+                        state += ", today:off"
+                    print(f"{n:>2}  {sl.hhmm:<6} {sl.food_g:>5g}g {sl.water_g:>6g}g  {state}")
+
+            if args.schedule_cmd == "show":
+                show(slots); return 0
+
+            def pick(n: int) -> int:
+                if not 1 <= n <= len(slots):
+                    raise SystemExit(f"slot {n} out of range (1-{len(slots)})")
+                return n - 1
+
+            if args.schedule_cmd == "set":
+                i = pick(args.slot)
+                sl = slots[i]
+                secs = sl.seconds_from_midnight
+                if args.time:
+                    try:
+                        hh, mm = (int(x) for x in args.time.split(":"))
+                        assert 0 <= hh < 24 and 0 <= mm < 60
+                    except Exception:
+                        raise SystemExit(f"bad --time {args.time!r}; use HH:MM")
+                    secs = hh * 3600 + mm * 60
+                food = sl.food_g if args.food is None else args.food
+                water = sl.water_g if args.water is None else args.water
+                if not 0 <= food <= 60 or not 0 <= water <= 600:
+                    raise SystemExit("food 0-60 g, water 0-600 g")
+                slots[i] = replace(sl, seconds_from_midnight=secs, food_g=food, water_g=water)
+            elif args.schedule_cmd == "set-all":
+                if args.food is None and args.water is None:
+                    raise SystemExit("give --food and/or --water")
+                for i, sl in enumerate(slots):
+                    if not sl.enabled:
+                        continue
+                    food = sl.food_g if args.food is None else args.food
+                    water = sl.water_g if args.water is None else args.water
+                    if not 0 <= food <= 60 or not 0 <= water <= 600:
+                        raise SystemExit("food 0-60 g, water 0-600 g")
+                    slots[i] = replace(sl, food_g=food, water_g=water)
+            elif args.schedule_cmd in ("enable", "disable"):
+                i = pick(args.slot)
+                slots[i] = replace(slots[i], enabled=args.schedule_cmd == "enable")
+
+            await r.set_schedule(slots)
+            await asyncio.sleep(2)
+            print("written — device now reports:\n")
+            show((await r.status()).schedule)
+        elif args.cmd == "defaults":
+            cur = (await r.status()).default_feed
+            if args.food is None and args.water is None and args.soak is None:
+                print(f"food {cur.food_g:g}g  water {cur.water_g:g}g  soak {cur.soak_min}min "
+                      f"(1:{cur.ratio:.1f})")
+                return 0
+            food = cur.food_g if args.food is None else args.food
+            water = cur.water_g if args.water is None else args.water
+            soak = cur.soak_min if args.soak is None else args.soak
+            if not 0 <= food <= 60 or not 0 <= water <= 600 or not 0 <= soak <= 30:
+                raise SystemExit("food 0-60 g, water 0-600 g, soak 0-30 min")
+            await r.set_default_feed(food, water, soak)
+            await asyncio.sleep(2)
+            new = (await r.status()).default_feed
+            print(f"food {new.food_g:g}g  water {new.water_g:g}g  soak {new.soak_min}min")
+            if new.soak_min != cur.soak_min:
+                print("note: changing the soak also shifts when scheduled meals start "
+                      "preparing — the feeder works backwards from soak + ~40s per gram "
+                      "of food so the meal lands at the slot time.")
         elif args.cmd == "feedctrl":
             print(await r.feed_control({"pause": FeedCtrl.PAUSE, "resume": FeedCtrl.RESUME, "end": FeedCtrl.END}[args.action]))
         elif args.cmd == "pump":

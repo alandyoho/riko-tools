@@ -32,28 +32,121 @@ sync source.
 - **Why it matters:** decides whether cloud outages are a feeding risk or just a
   monitoring blind spot.
 
-### Does the device re-weigh the bowl more than once after serving?
-We know it samples on physical bowl removal/insertion and ~10 min after serving.
-If that's the only post-meal sample, "retract the tray once the food is gone"
-can't be built without physically cycling the bowl.
+### Is the `sign` header on Neakasa's own API actually enforced?
+The app talks to **two** backends with different auth. Aliyun (`us-east-1.api-iot.aliyuncs.com`)
+uses standard API Gateway HMAC-SHA1 signing, which our library already does. But the
+intake ledger lives on `usapi.neakasapet.com`, which uses `token` + `uid` + `sign`
+headers. The `sign` is presumably HMAC over the params with a secret baked into the
+app — unextractable on iOS.
 
-- Leave a known weight (plastic cap, ~3.8 g) in the bowl and don't touch anything.
-- Watch `pushes.jsonl` for an unprompted `bowlStatus` push.
-- Partially attempted 2026-09-07; inconclusive, cap was removed before the slot.
-- **Why it matters:** blocks the retract-when-empty feature, which is the one that
-  stops the cat getting under the machine.
+Captured request shape:
+```
+GET https://usapi.neakasapet.com/api/feeder/record
+    ?device_name=<serial>&user_id=<id>&bind_status=1
+    &start_time=<unix>&end_time=<unix>&data_type=0
+headers: token, uid, sign, appid, timestamp, request-id, version
+```
 
-### Food dispensing accuracy
-Water is measured and excellent (±0.2 g). Food has never been measured on its own.
+- Replay it verbatim with curl. Confirm it returns data.
+- Then change `start_time` to a week earlier and resend, **without** changing `sign`.
+  If it still returns data, the signature doesn't cover the query params and a
+  captured token is enough to read the ledger.
+- Also worth learning: how long does the `token` stay valid?
+- **Why it matters:** this endpoint has everything the Aliyun channel lacks — per-meal
+  planned vs actual grams, failure records with reason codes, and the eat sessions.
 
-- `riko feed 8 0` into a weighed bowl, a few times, at different amounts (4, 8, 16).
-- Tip the morsels back into the hopper or count them against the day's intake.
-- **Why it matters:** food is the part that affects the cat's calories, and the one
-  unexplained result so far (34.25 g delivered on a 32 g target) has to be food.
+### Confirm the over-delivery against the device's own records
+The feeder's ledger says it delivered what was planned; two scales say otherwise.
+
+| Source | 16:00 meal |
+|---|---|
+| Neakasa ledger (`feed_weight` + `water_weight`) | 8 + 23 = 31 g |
+| Riko's own load cell | 36 g |
+| Kitchen scale | 35.5 g |
+
+So the metering believes it dispensed 8 g of food and the bowl says otherwise. The
+overshoot is invisible in the app, which will always show the planned figure.
+
+- Still needs the food-only feed (`riko feed 8 0`) to attribute the excess to food
+  rather than water. Deferred — wasteful of food.
+- Cheaper alternative: compare `water_weight` in the ledger (consistently 22–23 g
+  against a planned 24) with the water-only test results (accurate to ±0.2 g). If
+  the device under-reports water it may be under-reporting food too, in which case
+  the real dispense is higher than either number.
+
+### Why did the 16:00 meal not produce an eat record?
+The captured ledger shows `eat_list` records as timed windows, and only for meals
+the bowl was left alone after:
+
+| Meal | Window | Result |
+|---|---|---|
+| 00:52 (left alone ~2 min) | 19.5 min | ate 34 g, 0 left |
+| 04:00 (untouched) | exactly 601 s | ate 28 g, 1 left |
+| 08:00 (untouched) | exactly 601 s | ate 28 g, 1 left |
+| 12:00-ish manual feeds (bowl lifted) | none | — |
+| 16:00 (bowl lifted at +11 s) | none | — |
+
+**Not** the freshness manager — it was off from 00:28, before all of these. The
+pattern is that lifting the bowl cancels the eat measurement.
+
+- **Test at the next meal: don't touch the bowl at all.** Confirm an eat record
+  appears in the ledger about 10 minutes later.
+- The 601-second windows suggest a fixed 10-minute observation period; the 00:52
+  one ran 19.5 minutes, so it may end early when the bowl reads empty.
+- **Why it matters:** measuring a meal on a kitchen scale and getting the device's
+  own intake reading are mutually exclusive on the same feed. Today's overshoot
+  numbers cost us three eat records.
+
+### Can intake data be read without the app?
+The eat records exist only on `usapi.neakasapet.com` — they never appear as an
+Aliyun property push, which is why our watcher has never seen one. So "has the cat
+eaten?" is answerable only through that endpoint, or by physically cycling the bowl.
+
+- Depends on the `sign` question above.
+- Fallback: freshness manager ON with `leftOverTTH` at its maximum (300 g) — it can
+  never decide to retract, but might produce more weight samples. Untested.
+- **Why it matters:** blocks the retract-when-empty feature and any intake tracking.
+
+### Food dispensing accuracy — the feeder is over-delivering
+Now two consistent measurements of a full 8 g / 24 g meal, both over target:
+
+| When | Bowl | Total | Delivered | Target | Over |
+|---|---|---|---|---|---|
+| 2026-09-07 ~12:08 | 68.75 g | 103.0 g | 34.25 g | 32 g | +2.25 g |
+| 2026-09-07 16:00 | 68.30 g | 103.8 g | 35.50 g | 32 g | +3.50 g |
+
+Water tested clean in isolation (12/24/36 g requested → 11.9/24.1/36.2 g), so the
+excess is *probably* food — implying ~10–11.5 g dispensed where 8 was asked for,
+28–44% high. At +3 g per meal over six meals that's ~66 g/day against a 48 g target,
+which matters for the cat.
+
+**But this is not yet proven.** The water tests were water-only feeds; the pump may
+run longer when food is present, to wash the ground food through the chute. That
+would put the excess on the water side, where it's harmless.
+
+- `riko feed 8 0` into a weighed bowl — dry food, no water. Repeat at 4, 8, 16 g.
+- Tip the morsels back into the hopper, or count them against the day's intake.
+- **Why it matters:** decides whether this is a calorie problem or a non-issue.
+  Highest priority test on this list.
 
 ---
 
 ## Recovery and the pump
+
+### [LIVE] First real code-70 under the monitor
+The monitor (`monitor.py`) runs as a systemd service `riko-monitor`, currently in
+**--dry-run**: it detects and notifies but does NOT remediate. The next actual pump
+stall is the long-awaited test of `unclog`'s prime-and-resume, observed safely.
+
+- Watch for a "Pump stalled - not auto-fixing (dry-run)" alert. That confirms
+  detection fires on a real stall.
+- Then, to actually test recovery: either wait for a later stall after dropping
+  --dry-run, or once confident, remove `--dry-run` from
+  `/etc/systemd/system/riko-monitor.service` and `sudo systemctl restart riko-monitor`.
+- After the first real auto-unclog, read `riko_capture/unclog_*.json` (the journal)
+  to confirm prime+resume worked and see whether waterProvide moved water in the
+  tray-retracted stall state — the one context we could never reach deliberately.
+- **Why it matters:** this is the last unverified assumption in the whole system.
 
 ### Does `unclog` actually work?
 Both halves are unproven and the next real code 70 settles them.
@@ -90,11 +183,6 @@ water reduced by the primed amount.
 
 ## Schedule and timing
 
-### Why did the noon slot fire at 11:50?
-Ten minutes early, with no explanation. The 04:00 and 08:00 slots fired on time.
-
-- Watch the next few slots and see whether it recurs or was a one-off.
-- Check whether `bDayEn` or the app's own scheduling is involved.
 
 ### Does the app ever rewrite `timeZoneMsg` back to `zone: -5`?
 Our fix has held through one reboot and a full day. Many apps re-sync the device
@@ -116,27 +204,21 @@ bowl does not release it; only `feedCtrl END` clears it.
 
 ## Lower priority / rainy day
 
-### Pull filenames and service semantics out of the Android APK
-`cfgRead` doesn't answer (gateway times out with 20056 on every guessed filename,
-while `getVoltage` answers instantly — so it's the service, not the transport).
-`udpCmd` produces nothing observable. Both may be factory-tool commands.
+### Get the app's signing secret (blocked on iOS)
+Would answer the `sign` question and possibly the `cfgRead` filenames. iOS apps are
+encrypted on device, so this needs an Android phone — `strings` over the native libs
+plus `jadx` on the Java. Not worth a jailbreak.
 
-- `strings` over the APK's native libs, looking for config filenames.
-- Might also reveal what the app sends for "feed now" (which never appears on the
-  Aliyun channel — see below).
+Note the app shares `appKey: 32711645` across both backends, so the Neakasa-side
+secret is probably paired to it and baked into the binary.
 
-### Why don't app feeds show on the Aliyun command channel?
-The app's tare button shows up; its "feed now" doesn't. Yet the app's history logs
-API-issued feeds fine. So the history is device-reported, and the app's feed goes
-some other way.
+
 
 ### What does `smartPlanCfg` do?
-`{catId: 233099, drierFoodId: 10003}` — implies a cat profile and a food database
-on Neakasa's backend. Possibly drives portion recommendations.
-
-### Per-slot portions
-`fdPlanStr` stores food and water per slot; the app only exposes one default.
-Different portions per meal are possible via `set_schedule` and untested.
+`{catId: 233099, drierFoodId: 10003}`. The `catId` matches the cat profile in the
+ledger response (name, weight, birthday, breed, spay status), so Neakasa holds a cat
+record and probably uses it for portion recommendations. `drierFoodId` presumably
+indexes a food database — worth seeing whether changing it alters anything.
 
 ### Child lock — what does it actually gate?
 `childLockOnOff` is on. Presumed to disable the physical buttons (there's a
@@ -154,6 +236,22 @@ schedule, or a power blip. Not a Riko problem but worth finding.
 
 ---
 
+## Chores / cleanup
+
+- **[DONE] Removed the mitmproxy CA cert from the iPhone** (2026-09-07). Proxy also off.
+- **Rename the ntfy topic to something unguessable.** Currently `riko-sailor` in
+  `riko.toml` — short and guessable, so anyone could read the alerts or push fake
+  ones. Change it in the toml AND in the ntfy phone app. Also: `riko config` prints
+  `_notify` in cleartext; harmless but the topic is a mild secret.
+- **Change the Neakasa account password.** It was pasted in plaintext during setup
+  and its md5 appears in captured traffic; md5 is unsalted/reversible. Change it and
+  don't reuse it. (Then update `.env` / `riko.toml` on the Pi.)
+- **Scrub captures before publishing anything.** `riko_capture/tsl_thing_info_get*`
+  contains the device secret, MAC, and public IP; intercepted ledger/login bodies
+  contain user_id, the md5 password, and signed OSS URLs. All gitignored, but check
+  before sharing logs or a repo.
+
+
 ## Answered
 
 - **2026-09-07 — Is the bowl weight live?** No. `curWeight` is cached; polled every
@@ -169,5 +267,27 @@ schedule, or a power blip. Not a Riko problem but worth finding.
   Everything goes out over TLS to Aliyun.
 - **2026-09-07 — Does the clock fix survive a reboot?** Yes. `zone: -4` held through
   the 04:00 reboot and the 04:00/08:00 feeds fired on time.
+- **2026-09-07 — Where does the app's intake data come from?** A second backend,
+  `usapi.neakasapet.com`, entirely separate from the Aliyun channel we monitor.
+  `/api/feeder/record` returns per-meal planned vs actual grams, failure records
+  with reason codes, and eat sessions. Nothing of this crosses Aliyun, which is why
+  the watcher never saw a post-serve sample — there was never one to see.
+- **2026-09-07 — Does a stalled feed grind food before failing?** Yes. The noon
+  stall's ledger record shows `feed_weight: 5, water_weight: 0, status: 2` — 5 g
+  ground, no water, failed. Confirms the grinder runs before the pump, and validates
+  why `feedCtrl END` + re-feed double-doses.
 - **2026-09-07 — Does the bowl retract between meals?** No, not on its own. The tray
   stays out after serving. Only the freshness manager pulls it in early.
+- **2026-09-07 — Does the device re-weigh periodically?** No. A plastic cap sat in
+  the bowl for 90 minutes untouched; the reported weight never changed and never
+  picked up the cap. Samples happen only on physical bowl removal/insertion and
+  (usually) ~10 min after serving.
+- **2026-09-07 — Why do scheduled meals start early?** By design. The feeder works
+  backwards from its own time estimate (soak + ~40 s per gram of food) so the meal
+  is ready *at* the slot time, then holds the soaked food until the slot before
+  serving. The 16:00 meal: PREPARING 15:50:02, SERVING 16:00:01, IDLE 16:00:06 —
+  exact to the second. The noon slot's 11:50 start was this, not a bug.
+- **2026-09-07 — Do scheduled feeds apply the soak?** Yes; manual feeds don't. The
+  16:00 meal ground early then showed a 6:50 countdown before serving. Note the
+  soak setting is effectively a *minimum* — the real hold is whatever time is left
+  between finishing the grind and the scheduled slot.
