@@ -22,36 +22,77 @@ you just washed, and its "how much did the cat eat" numbers are wrong by the sam
 **The app's tare button does not fix this** — it zeroes the platform but never updates the
 stored 65 g. There is no bowl-weight setting anywhere in the app.
 
-**The fix:** send the correct weight directly. Two versions, same result.
+**The fix:** a small script sends the correct weight to the feeder directly.
 
-### Bash (recommended — no Python needed)
+### Never used a "terminal" before? Start here.
+
+You don't need to know anything technical. Follow these exactly. This is written for a
+**Mac** — the most common case. (On Windows this needs extra setup; skip to the Python
+section or ask someone technical.)
+
+**1. Weigh your empty bowl.** Use a kitchen scale. Most are ~68 g. Write down your number
+— you'll type it in later. If you don't have a scale, 68 is a safe default.
+
+**2. Download the script.** At the top of this page, click the green **`Code`** button →
+**Download ZIP**. Open your Downloads folder and double-click the ZIP to unzip it. You'll
+get a folder called `riko-tools-main`.
+
+**3. Open Terminal.** Press `Cmd + Space`, type `Terminal`, press Enter. A window with a
+text prompt appears. This is where you type commands. Don't worry — you'll only type two.
+
+**4. Go to the folder.** Type this, then a space, then **drag the `riko-tools-main` folder
+from Finder into the Terminal window** (it pastes the location for you), then press Enter:
+
+```
+cd 
+```
+
+(So it reads `cd /Users/you/Downloads/riko-tools-main` — the `cd` means "go to".)
+
+**5. Run the fix.** Type this, replacing the email with yours and `68` with your bowl's
+weight, then press Enter:
+
+```
+bash fix_bowl_weight.sh -e you@example.com -w 68
+```
+
+- It asks for your **Neakasa password**. Type it (you won't see the characters — that's
+  normal) and press Enter.
+- The first time, it may say a tool called `jq` is missing and offer to install it. Type
+  `y` and press Enter. (If it needs your **Mac** password for that install, that's the
+  password you use to log into your computer, not your Neakasa one.)
+- It tells you to **take the bowl out of the tray**. Do it, then press Enter.
+- It does its thing, then tells you to **put the bowl back**. Do it, press Enter.
+- It confirms the bowl now reads about 0 g. Done.
+
+That's it. If anything looks wrong, nothing is broken — you can just run step 5 again.
+
+### Already comfortable with a terminal?
 
 ```bash
-# weigh your empty bowl first, then:
 ./fix_bowl_weight.sh -e you@example.com -w 68
 ```
 
-Runs on **macOS or Linux**. Needs `curl`, `openssl`, `jq`, `xxd` — the script checks for
-them on first run and offers to install anything missing with your package manager
-(it asks first). It walks you through taking the bowl out, sets the value, has you put
-the bowl back, and confirms an empty bowl now reads ~0 g.
+macOS or Linux. Needs `curl`, `openssl`, `jq`, `xxd`; the script checks and offers to
+install anything missing. `-v` for verbose, `-n` for a dry run (auth + read, no write).
+Windows: use WSL or Git Bash.
 
-*(Windows: use WSL or Git Bash.)*
-
-### Python
+### Prefer Python (works on Windows too)
 
 ```bash
 pip install neakasa-litterbox-sdk
 python3 fix_bowl_weight.py --email you@example.com --weight 68
 ```
 
-Same thing, if you'd rather use Python or are on Windows.
+### For everyone
 
-**Both ask for your Neakasa password** — it's used only to log in, exactly as the app does,
-and is never stored. The source is right here; read it before you run it.
+**Your Neakasa password** is only used to log in, exactly as the app does, and is never
+saved anywhere. The full source is in this repo — read it, or have someone read it, before
+running it. It only ever contacts Neakasa's own servers.
 
-**Caveat:** the Neakasa app appears to overwrite this correction with its own default (65)
-when it syncs, seen after an app update. If your readings drift back, re-run the fix.
+**One catch:** the Neakasa app seems to reset this correction back to the wrong value (65)
+when it updates. If your readings drift back to showing phantom food, just run the fix
+again.
 
 ---
 
