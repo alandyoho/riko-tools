@@ -49,33 +49,44 @@ cd
 
 (So it reads `cd /Users/you/Downloads/riko-tools-main` — the `cd` means "go to".)
 
-**5. Run the fix.** Type this, replacing the email with yours and `68` with your bowl's
-weight, then press Enter:
+**5. Run the fix.** Type this and press Enter:
 
 ```
-bash fix_bowl_weight.sh -e you@example.com -w 68
+bash fix_bowl_weight.sh
 ```
 
-- It asks for your **Neakasa password**. Type it (you won't see the characters — that's
-  normal) and press Enter.
-- The first time, it may say a tool called `jq` is missing and offer to install it. Type
-  `y` and press Enter. (If it needs your **Mac** password for that install, that's the
-  password you use to log into your computer, not your Neakasa one.)
-- It tells you to **take the bowl out of the tray**. Do it, then press Enter.
-- It does its thing, then tells you to **put the bowl back**. Do it, press Enter.
-- It confirms the bowl now reads about 0 g. Done.
+That's the whole command — no email, no weight, nothing to remember. The script then
+**walks you through everything, one step at a time:**
 
-That's it. If anything looks wrong, nothing is broken — you can just run step 5 again.
+- Asks for your **Neakasa email and password**. The password is hidden as you type
+  (that's normal) and is only ever sent to Neakasa to log in — never saved.
+- The first time, if a tool called `jq` is missing, it offers to install it — type `y`.
+  (If that install asks for your **Mac** password, that's your computer's login password,
+  not your Neakasa one.)
+- If you have **more than one feeder**, it lists them and lets you pick with the arrow keys.
+- It **weighs your bowl for you** using the feeder's own scale — no kitchen scale needed.
+  It'll ask you to put an empty bowl on the tray (and to lift it off and back on, so the
+  feeder takes a fresh reading). If you have several bowls, it can measure them all and
+  average them.
+- It shows you what's wrong and asks you to confirm before changing anything.
+- It tells you to take the bowl **off** to apply, then put it **back** to verify, and
+  confirms the fix worked.
+
+That's it — just answer the prompts. Nothing is destructive; if anything looks off you
+can re-run it any time.
 
 ### Already comfortable with a terminal?
 
 ```bash
-./fix_bowl_weight.sh -e you@example.com -w 68
+./fix_bowl_weight.sh                       # guided: prompts for everything
+./fix_bowl_weight.sh -e you@x.com -w 68    # or pass values directly to skip the prompts
 ```
 
-macOS or Linux. Needs `curl`, `openssl`, `jq`, `xxd`; the script checks and offers to
-install anything missing. `-v` for verbose, `-n` for a dry run (auth + read, no write).
-Windows: use WSL or Git Bash.
+Run with no arguments for the guided flow (prompts for email/password, picks the device,
+measures the bowl via the feeder's scale, confirms). Or pass flags to script it:
+`-e email`, `-w grams`, `-d device_name` (for multiple feeders), `-n` dry-run, `-v`
+verbose. macOS or Linux; needs `curl`, `openssl`, `jq`, `xxd` (it offers to install any
+that are missing). Windows: use WSL or Git Bash.
 
 ### Prefer Python (works on Windows too)
 
@@ -83,6 +94,10 @@ Windows: use WSL or Git Bash.
 pip install neakasa-litterbox-sdk
 python3 fix_bowl_weight.py --email you@example.com --weight 68
 ```
+
+Same fix via Python if you're on Windows or would rather not use bash. (The rich guided
+walkthrough — device picker, self-measuring, multi-bowl averaging — is in the bash
+version; the Python one takes the values as flags.)
 
 ### For everyone
 

@@ -8,3 +8,4 @@ __pycache__/
 neakasa_decompiled/
 key-extraction-plan.md
 logs*.txt
+*.bak
