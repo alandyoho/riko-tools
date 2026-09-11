@@ -53,24 +53,8 @@ while getopts "e:p:w:d:nv" o; do case $o in
   *) echo "usage: $0 -e email [-p pass] -w grams [-d device_name] [-n] [-v]"; exit 2;;
 esac; done
 if [[ -z $EMAIL ]]; then
-  if [[ ! -t 0 ]]; then echo "need -e email (no terminal to prompt)" >&2; exit 2; fi
-  # colors may not be defined yet (they're set later); define minimal ones here
-  _b=$'\033[1;44;97m'; _c=$'\033[1;96m'; _g=$'\033[1;92m'; _o=$'\033[0m'
-  [[ -t 1 ]] || { _b=""; _c=""; _g=""; _o=""; }
-  echo
-  echo "${_b} Neakasa Riko — bowl-weight fixer ${_o}"
-  echo
-  echo "What this does: your Riko ships thinking the food bowl weighs 65 g, but the"
-  echo "real bowls are ~68 g. That ~3 g gap makes it report food left in an empty bowl,"
-  echo "and the app's tare button doesn't fix it. This corrects the stored weight."
-  echo
-  echo "${_c}It logs into your Neakasa account, exactly like the app does.${_o}"
-  echo "Your password is used only to log in and is never saved or sent anywhere but"
-  echo "Neakasa. The full source is right here in this file — read it, or have someone"
-  echo "read it, before running. It only ever talks to Neakasa's own servers."
-  echo
-  read -rp "${_g}➤ Your Neakasa account email: ${_o}" EMAIL
-  [[ -z $EMAIL ]] && { echo "No email entered — nothing to do."; exit 2; }
+  if [[ -t 0 ]]; then read -rp "Neakasa email: " EMAIL
+  else echo "need -e email (no terminal to prompt)" >&2; exit 2; fi
 fi
 
 # ---- dependency preflight ----------------------------------------------------
@@ -120,26 +104,9 @@ check_deps() {
 }
 check_deps || exit 2
 
-if [[ -z $PASSWORD ]]; then
-  _g=$'\033[1;92m'; _o=$'\033[0m'; [[ -t 1 ]] || { _g=""; _o=""; }
-  read -rsp "${_g}➤ Password for ${EMAIL}: ${_o}" PASSWORD; echo
-  echo "  (typing is hidden; this is only sent to Neakasa to log in)"
-  [[ -z $PASSWORD ]] && { echo "No password entered." >&2; exit 2; }
-fi
+[[ -z $PASSWORD ]] && { read -rsp "Neakasa password: " PASSWORD; echo; }
 
 vlog(){ [[ $VERBOSE == 1 ]] && echo "  $*" >&2 || true; }
-
-# --- visual emphasis (falls back to plain text if not a terminal) -------------
-if [[ -t 1 ]]; then
-  C_BANNER=$'\033[1;44;97m'   # bold white on blue
-  C_ACT=$'\033[1;92m'         # bold green — an action the user must take
-  C_HDR=$'\033[1;96m'        # bold cyan — section header
-  C_OFF=$'\033[0m'
-else
-  C_BANNER="" C_ACT="" C_HDR="" C_OFF=""
-fi
-banner(){ echo; echo "${C_BANNER} $* ${C_OFF}"; }   # highlighted current step
-act(){    echo "${C_ACT}➤ $*${C_OFF}"; }              # highlighted call-to-action
 
 
 # ---- primitives --------------------------------------------------------------
@@ -278,18 +245,6 @@ R5=$(iot_call "$API" "account/createSessionByAuthCode" \
       "$(jq -cn --arg s "$SID" --arg k "$APP_KEY" '{request:{authCode:$s,accountType:"OA_SESSION",appKey:$k}}')" \
       "1.0.4")
 IOTTOKEN=$(jq -r '.data.iotToken' <<<"$R5")
-
-# Re-mint the iotToken. It expires quickly (≈ tens of seconds), so any step that
-# happens after user interaction (seating the bowl) must refresh first, or calls
-# fail with code 29003 "identityId is blank".
-refresh_token() {
-  local r
-  r=$(iot_call "$API" "account/createSessionByAuthCode" \
-        "$(jq -cn --arg s "$SID" --arg k "$APP_KEY" '{request:{authCode:$s,accountType:"OA_SESSION",appKey:$k}}')" \
-        "1.0.4")
-  local t; t=$(jq -r '.data.iotToken // empty' <<<"$r")
-  [[ -n $t ]] && IOTTOKEN=$t
-}
 [[ $IOTTOKEN == null || -z $IOTTOKEN ]] && { echo "createSession failed: $R5" >&2; exit 1; }
 
 RL=$(iot_call "$API" "uc/listBindingByAccount" '{}' "1.0.8" "$IOTTOKEN")
@@ -360,16 +315,9 @@ echo "targeting device: $DEVICE"
 vlog "iotId=$IOTID"
 
 read_bowl() {
-  local rp code
+  local rp
   rp=$(iot_call "$API" "thing/properties/get" \
         "$(jq -cn --arg i "$IOTID" '{iotId:$i}')" "1.0.4" "$IOTTOKEN")
-  code=$(jq -r '.code // 0' <<<"$rp")
-  if [[ $code == 29003 ]]; then          # token expired — refresh and retry once
-    refresh_token
-    rp=$(iot_call "$API" "thing/properties/get" \
-          "$(jq -cn --arg i "$IOTID" '{iotId:$i}')" "1.0.4" "$IOTTOKEN")
-  fi
-  [[ -n ${DEBUG:-} ]] && echo "RAW: $rp" >&2
   CUR=$(jq -r '.data.bowlStatus.value.bowlGram // "?"' <<<"$rp")
   SCALE=$(jq -r '.data.bowlStatus.value.curWeight // "?"' <<<"$rp")
   BOWLIN=$(jq -r '.data.bowlStatus.value.bBowlIn // "?"' <<<"$rp")
@@ -381,147 +329,79 @@ if [[ -z $WEIGHT ]]; then
   if [[ ! -t 0 ]]; then echo "need -w grams (no terminal to measure)" >&2; exit 2; fi
   echo
   echo "I can read your bowl's weight from the feeder's own scale (no kitchen scale needed)."
-  echo "Your Riko may have shipped with more than one bowl — they can differ by ~1 g,"
-  echo "so if you rotate bowls, measuring all of them gives the best stored value."
-  echo
-  read -rp "How many bowls do you want to measure? [1-4, default 1]: " NB
-  [[ -z $NB || ! $NB =~ ^[0-9]+$ ]] && NB=1
-  [[ $NB -lt 1 ]] && NB=1; [[ $NB -gt 4 ]] && NB=4
-
-  # if the user typed a plain number at the old prompt style, treat as manual weight
-  # read the scale after a bowl has just been placed (placement itself triggers the
-  # fresh sample, so no separate lift/reseat step is needed).
-  measure_placed() {   # echoes a clean device reading, or empty on failure
-    local w="" a
-    for a in 1 2 3 4 5 6; do
+  echo "Put your EMPTY, DRY bowl on the tray, seated properly."
+  read -rp "Ready? Press Enter to measure (or type a weight in grams): " ans
+  if [[ -n $ans && $ans =~ ^[0-9]+$ ]]; then
+    WEIGHT=$ans
+  else
+    echo "Lift the bowl off the tray, wait a second, then set it back down."
+    echo "(That's what makes the scale take a fresh reading.)"
+    read -rp "Done? Press Enter to read the weight... " _
+    # the fresh sample takes a few seconds to reach the cloud; poll for a good one
+    WEIGHT=""
+    for attempt in 1 2 3 4 5 6; do
       sleep 2; read_bowl
       if [[ $BOWLIN == 1 && $SCALE =~ ^[0-9]+$ && $SCALE -ge 20 && $SCALE -le 200 ]]; then
-        w=$SCALE; break
+        WEIGHT=$SCALE; break
       fi
-      [[ $a -lt 6 ]] && echo "   reading… (bowl_in=$BOWLIN scale=${SCALE}g)" >&2
+      [[ $attempt -lt 6 ]] && echo "  reading… (bowl_in=$BOWLIN scale=${SCALE}g)"
     done
-    echo "$w"
-  }
-
-  echo
-  echo "Tip: letting the feeder weigh the bowl (just press Enter) is usually best — its"
-  echo "scale reads a hair light, but the SAME scale reads your empty bowl later, so the"
-  echo "small offset cancels out and 'food left' lands near zero. You can type a"
-  echo "kitchen-scale weight instead if you like, but it isn't more accurate for this."
-  if [[ $NB -gt 1 ]]; then
-    echo
-    echo "For each bowl: swap it onto the tray, then press Enter — no extra lifting needed."
-  fi
-
-  SUM=0; COUNT=0
-  for ((b=1; b<=NB; b++)); do
-    if [[ $NB -gt 1 ]]; then banner "BOWL $b OF $NB"; else echo; fi
-    if [[ $b -eq 1 ]]; then
-      act "Put an EMPTY, DRY bowl on the tray — or if one's already there, lift it fully OFF and set it back."
-      echo "   The Riko only re-weighs when it detects the bowl leave and return, so make sure"
-      echo "   it actually comes off the tray (a quick tap may not register). Give it a moment on."
-    else
-      act "Swap to the next EMPTY bowl: take the last one fully OFF, then set this one on."
-      echo "   Lifting it clear is what makes the Riko notice \"bowl removed\" and take a fresh reading."
+    if [[ -z $WEIGHT ]]; then
+      echo >&2
+      echo "Couldn't get a clean reading after several tries." >&2
+      echo "Make sure the bowl is EMPTY and fully SEATED on the tray, then either:" >&2
+      echo "  - re-run and try again, or" >&2
+      echo "  - weigh the bowl on a kitchen scale and pass it: -w <grams>" >&2
+      exit 1
     fi
-    read -rp "   Press Enter to measure — or type a weight in grams and hit Enter: " ans
-    if [[ -n $ans && $ans =~ ^[0-9]+$ ]]; then
-      m=$ans
-      echo "   Using ${m} g (typed)."
-    else
-      m=$(measure_placed)
-      if [[ -z $m ]]; then
-        echo "   Couldn't get a clean reading for this bowl — skipping it." >&2
-        continue
-      fi
-      echo "   Measured ${m} g."
-    fi
-    SUM=$((SUM + m)); COUNT=$((COUNT + 1))
-  done
-
-  if [[ $COUNT -eq 0 ]]; then
-    echo "No usable bowl measurements. Re-run, or pass -w <grams>." >&2; exit 1
-  fi
-  # average, rounded to nearest gram
-  WEIGHT=$(( (SUM + COUNT/2) / COUNT ))
-  if [[ $COUNT -gt 1 ]]; then
-    echo
-    echo "Measured $COUNT bowls, average ${WEIGHT} g — storing that."
+    echo "Measured bowl weight: ${WEIGHT} g"
+    echo "(The feeder's scale can read ~1 g light; that's fine.)"
   fi
 fi
 
 [[ $DRYRUN == 1 ]] && { echo "[dry run] would set stored weight to ${WEIGHT} g. stopping."; exit 0; }
-if [[ $CUR == "$WEIGHT" ]]; then
+if [[ $CUR == "$WEIGHT" ]]; then echo "Already set to ${WEIGHT} g. nothing to do."; exit 0; fi
+
+if [[ -t 0 ]]; then
   echo
-  echo "Good news: the stored weight is already ${WEIGHT} g — nothing to fix."
-  echo "Your feeder's food-in-bowl readings should be accurate. You're done."
-  exit 0
+  echo "Stored bowl weight is ${CUR} g; your bowl actually weighs about ${WEIGHT} g."
+  [[ $CUR =~ ^[0-9]+$ ]] && echo "So every reading is off by about $((WEIGHT - CUR)) g."
+  read -rp "Fix it (set stored weight to ${WEIGHT} g)? [Y/n] " ok
+  [[ $ok =~ ^[Nn] ]] && { echo "left unchanged."; exit 0; }
 fi
 
 if [[ -t 0 ]]; then
   echo
-  banner "REVIEW"
-  echo "Your feeder currently thinks an empty bowl weighs ${CUR} g."
-  echo "Your bowl actually weighs about ${WEIGHT} g."
-  if [[ $CUR =~ ^[0-9]+$ ]]; then
-    echo "That ${CUR}-vs-${WEIGHT} gap means every \"food left in bowl\" number is off by"
-    echo "about $((WEIGHT - CUR)) g — which is why an empty bowl can look like it still has food."
-  fi
-  echo "Setting the stored weight to ${WEIGHT} g fixes that."
-  echo
-  read -rp "${C_ACT}➤ Apply this fix? [Y/n] ${C_OFF}" ok
-  [[ $ok =~ ^[Nn] ]] && { echo "No changes made. Your feeder is exactly as it was."; exit 0; }
-fi
-
-if [[ -t 0 ]]; then
-  echo
-  banner "STEP 1 of 2 — APPLY"
-  act "Take the bowl OFF the tray and set it aside."
-  echo "   Why: applying the fix re-zeroes the scale. The tray must be empty so it"
-  echo "   zeroes against nothing — if the bowl is on it, the zero point will be wrong."
-  read -rp "   Bowl is off the tray? Press Enter to apply... " _
-  refresh_token
+  echo "Now take the BOWL OFF the tray (the scale is about to re-zero)."
+  read -rp "Bowl removed? Press Enter to apply... " _
 fi
 RS=$(iot_call "$API" "thing/service/invoke" \
       "$(jq -cn --arg i "$IOTID" --argjson w "$WEIGHT" \
          '{iotId:$i,identifier:"resetScaleZero",args:{bowlGram:$w}}')" "1.0.5" "$IOTTOKEN")
 if [[ $(jq -r '.code' <<<"$RS") == 200 ]]; then
   echo
-  echo "Applied — the feeder now stores ${WEIGHT} g as the empty-bowl weight."
+  echo "Done — stored bowl weight is now ${WEIGHT} g."
   echo
-  banner "STEP 2 of 2 — VERIFY"
-  act "Put a bowl BACK on the tray (empty), seated properly."
-  echo "   Why: with an empty bowl on, the feeder should now report ~0 g of food."
-  echo "   That confirms the fix took. We'll read it for you."
-  read -rp "   Bowl is back on? Press Enter to check... " _
-  refresh_token
-  # poll for a fresh reading (read_bowl auto-refreshes on token expiry)
-  SC="?"; GR="?"; IN="?"
-  for a in 1 2 3 4 5 6; do
-    sleep 2; read_bowl
-    SC=$SCALE; GR=$CUR; IN=$BOWLIN
-    [[ $IN == 1 && $SC =~ ^[0-9]+$ ]] && break
-    [[ $a -lt 6 ]] && echo "   checking… (bowl_in=$IN)"
-  done
-  echo
-  if [[ $IN == 1 && $SC =~ ^[0-9]+$ && $GR =~ ^[0-9]+$ ]]; then
+  echo "Last step: put the food BOWL BACK on the tray."
+  read -rp "Bowl replaced? Press Enter to verify: " _
+  sleep 2
+  RV=$(iot_call "$API" "thing/properties/get" \
+        "$(jq -cn --arg i "$IOTID" '{iotId:$i}')" "1.0.4" "$IOTTOKEN")
+  SC=$(jq -r '.data.bowlStatus.value.curWeight // "?"' <<<"$RV")
+  GR=$(jq -r '.data.bowlStatus.value.bowlGram // "?"' <<<"$RV")
+  IN=$(jq -r '.data.bowlStatus.value.bBowlIn // "?"' <<<"$RV")
+  if [[ $IN == 1 ]]; then
     LEFT=$(( SC - GR ))
+    echo "Bowl detected. Scale reads ${SC} g, stored weight ${GR} g -> ${LEFT} g of food."
     if [[ ${LEFT#-} -le 2 ]]; then
-      echo "${C_ACT}✓ All set.${C_OFF} The empty bowl now reads about ${LEFT} g of food — that's correct."
-      echo "  Your feeder's food-in-bowl numbers will be accurate from here on."
+      echo "Looks right: an empty bowl reads about zero. You're done."
     else
-      echo "Set to ${GR} g, but the empty bowl still reads ${LEFT} g of food — more than expected."
-      echo "  If the bowl really was empty, it may weigh a different amount. You can re-run"
-      echo "  and measure again, or weigh it on a kitchen scale and pass it with -w <grams>."
+      echo "Hmm, that's more than expected for an empty bowl. If the bowl was empty,"
+      echo "your bowl may weigh a different amount than ${WEIGHT} g -- weigh it and re-run."
     fi
   else
-    echo "The weight was set to ${GR} g, but we couldn't read the bowl back to confirm"
-    echo "  (the feeder can be slow to report). It very likely worked — check the app,"
-    echo "  or re-run this to verify."
+    echo "(Couldn't confirm the bowl is seated, but the weight was set to ${GR} g.)"
   fi
-  echo
-  echo "Heads-up: opening the Neakasa app can silently reset this value back to the"
-  echo "wrong default. If your readings drift, just run this again."
 else
   echo "invoke returned: $RS" >&2; exit 1
 fi
