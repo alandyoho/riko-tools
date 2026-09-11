@@ -37,6 +37,7 @@ SEARCH_PATHS = [Path("riko.toml"), Path.home() / ".config" / "riko" / "config.to
 ENV_MAP: dict[str, tuple[str, str]] = {
     "RIKO_EMAIL": ("account", "email"),
     "RIKO_PASSWORD": ("account", "password"),
+    "RIKO_FEEDER_OWNER_ID": ("feeder", "feeder_owner_id"),
     "NEAKASA_EMAIL": ("account", "email"),
     "NEAKASA_PASSWORD": ("account", "password"),
     "RIKO_REGION": ("account", "region"),
@@ -48,7 +49,7 @@ ENV_MAP: dict[str, tuple[str, str]] = {
     "RIKO_STATE_DIR": ("paths", "state_dir"),
 }
 
-INT_KEYS = {"bowl_grams", "tz_offset", "poll_seconds"}
+INT_KEYS = {"bowl_grams", "tz_offset", "poll_seconds", "feeder_owner_id"}
 SECRET_KEYS = {"password"}
 
 
@@ -78,11 +79,23 @@ class Config:
     # runtime
     poll_seconds: int = 15
 
+    # feeder owner's user_id (NOT a secret — an opaque account number). The intake
+    # ledger keys off this param, so the automation account can read the owner's
+    # records by passing it. Read by neakasa.py. Find it once via a login as the
+    # owner (ali_user_id), then hardcode it here.
+    feeder_owner_id: int = 0
+
     # notify config passthrough ([notify] table), read by notify.py
     _notify: dict = field(default_factory=dict, repr=False)
 
     # provenance, for debugging
     source_file: Path | None = field(default=None, repr=False)
+
+    def require_feeder_owner(self) -> None:
+        if not self.feeder_owner_id:
+            raise ConfigError(
+                "No feeder_owner_id set. Put the feeder owner's user_id under [feeder] "
+                "feeder_owner_id in your config, or pass --owner-id to neakasa.py.")
 
     def require_credentials(self) -> None:
         if not self.email or not self.password:
@@ -145,10 +158,10 @@ def load(path: str | Path | None = None) -> Config:
     notify_tbl = merged.get("notify", {}) if isinstance(merged.get("notify"), dict) else {}
 
     flat: dict[str, Any] = {}
-    for section in ("account", "device", "paths", "runtime"):
+    for section in ("account", "device", "paths", "runtime", "feeder"):
         flat.update(merged.get(section, {}))
     # tolerate top-level scalar keys too (skip known section tables)
-    _sections = {"account", "device", "paths", "runtime", "notify"}
+    _sections = {"account", "device", "paths", "runtime", "notify", "feeder"}
     flat.update({k: v for k, v in merged.items()
                  if not isinstance(v, dict) and k not in _sections})
 
@@ -208,6 +221,12 @@ state_dir = "riko_state"
 
 [runtime]
 poll_seconds = 15
+
+# The intake ledger keys off the feeder OWNER's user_id (an account number, not a
+# secret). The automation [account] above can read the owner's history by passing it.
+# Find it once by logging in as the owner and printing ali_user_id.
+[feeder]
+# feeder_owner_id = 400133257
 """
 
 

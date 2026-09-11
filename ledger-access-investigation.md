@@ -20,12 +20,19 @@ The ledger request needs, all reproducible from public values:
   — note the timestamp format `seconds.millis`, NOT the SDK's `generate_session_token`
   which uses `@milliseconds`. Same AES key (the session key from login), different plaintext.
 - **params**: `data_type=0, device_name=<serial>, start_time, end_time (unix seconds),
-  user_id=<ali_user_id>, bind_status=1`
+  user_id=<FEEDER OWNER's ali_user_id>, bind_status=1`
+  — the `user_id` here is what authorizes the read; it can be an owner you're merely
+  *shared* to, not the account you authenticated as.
 
-**And the one that actually mattered: log in as the account that OWNS THE FEEDER IN THE
-PHONE APP.** Here that was `stidwillyoho@gmail.com` (user 400133257), NOT the automation
-account `alandyoho@gmail.com` (user 400133342). Same email family, genuinely separate
-Neakasa user records. Everything else was reproducible for days; this was the blocker.
+**And the one that actually mattered: the ledger is keyed off the `user_id` PARAMETER,
+not the authenticated account.** You do NOT need to log in as the feeder owner. Any
+account the device is shared to can read the owner's records by passing the owner's
+user_id as the `user_id` query param (here `400133257`, the feeder owner). We spent a
+long time believing we had to *be* the owner account (`stidwillyoho`, 400133257) rather
+than the automation account (`alandyoho`, 400133342) — but authenticating as `alandyoho`
+and passing `user_id=400133257` returns the records. That's exactly how the phone app
+reads history when logged into a shared account. Confirmed:
+`authed 400133342, param user_id=400133257 -> code:0, 48 feeds`.
 
 Working implementation: `neakasa.py`.
 
@@ -37,7 +44,7 @@ Working implementation: `neakasa.py`.
 | "The iOS app key `32711645` is what the feeder uses" | That's iOS-only. Android/SDK uses `32715650`. Testing against `32711645` made every oracle fail. |
 | "The secret is hidden in the app binary; we must extract it" | It was in the SDK the whole time. Static search of 400k+ strings found nothing because there was nothing to find. |
 | "`DFA84B10B7ACDD25` is the token AES key" (most frequent Frida key) | Red herring — some other cipher. Token uses the per-session `aes_key`/`aes_iv` from login. |
-| "The feeder backend is unreachable / different identity we can't be" | Reachable. We just had to log in as the account that owns the feeder. |
+| "The feeder backend needs us to BE the owner account" | No. It keys off the `user_id` param. A shared account reads the owner's records by passing the owner's id. |
 | "The SDK's session token works everywhere" | Its `@milliseconds` format is rejected by the feeder backend, which wants `@seconds.millis`. |
 
 ## Sequence of what actually moved us forward
@@ -52,9 +59,13 @@ Working implementation: `neakasa.py`.
 3. **Frida on the Android app in an emulator** to observe crypto at runtime. This is what
    resolved the token format and, crucially, revealed the app authenticates as the feeder
    owner's user id — the clue that led to the account realization.
-4. **The account realization**: the app encrypted `400133257` as its uid even though the
-   automation login yields `400133342`. Different accounts. Logging in as `stidwillyoho`
-   returned `code:0` immediately.
+4. **The realization**: the Frida capture showed the app authenticating as one identity
+   but the feeder data belonging to another (400133257). That first read as "wrong
+   account," and logging in as `stidwillyoho` did return `code:0`. But the cleaner truth,
+   found right after: the automation account (`alandyoho`) reads the same records by
+   passing `user_id=400133257` in the params. The ledger authorizes by (device-share +
+   user_id param), not by the authenticated account being the owner. So you can run
+   everything on one automation account and just pass the owner's user_id.
 
 ## Queries / techniques that WORKED (repeat these)
 

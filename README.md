@@ -103,13 +103,36 @@ again.
 | `fix_bowl_weight.sh` / `.py` | The bowl-weight fix above. |
 | `riko.py` | Full command-line control of the feeder: status, feed now, edit the schedule, set the tare, set the timezone, decode errors, recover a stalled pump. |
 | `monitor.py` + `notify.py` + `config.py` | A background monitor (systemd-friendly) that watches for missed feeds, pump stalls, clock drift, low food/water and **setting changes**, fixes the safe cases under hard caps, and pushes phone notifications via [ntfy](https://ntfy.sh). |
-| `neakasa.py` | Reads the intake ledger (per-meal actual vs planned grams, eat sessions) from Neakasa's app backend. Needs a token captured from the phone app — see the file header. |
+| `neakasa.py` | Reads the intake ledger — per-meal actual-vs-planned grams, failure reasons, and eat sessions — from Neakasa's feeder backend. Self-sufficient: logs in with your account and needs the feeder owner's user_id (a number, not a secret). See "Intake history" below. |
 | `riko_discover.py`, `riko_tsl_probe.py`, `riko_trace.py`, `riko_poll.py`, `riko_pump_test.py` | Diagnostic scripts used to produce the findings. |
 
 `riko.py --help` and each script's header explain usage. Most read credentials from a
 `riko.toml` (see `config.py --example`) or `RIKO_EMAIL` / `RIKO_PASSWORD` env vars.
 
 ---
+
+## Intake history (what the cat actually ate)
+
+The feeder logs every meal to Neakasa's backend: planned vs actually-dispensed food
+and water, failure reasons, and post-meal "eat sessions" (how much was eaten). The app
+shows a sliver of this; `neakasa.py` pulls the lot.
+
+```bash
+python3 neakasa.py intake --days 14      # summary: delivered vs planned, failure counts
+python3 neakasa.py ledger --days 7       # per-meal table + eat sessions
+python3 neakasa.py raw --days 2          # raw JSON
+```
+
+It authenticates with your normal `[account]` credentials. One wrinkle worth knowing:
+the ledger is keyed off the feeder **owner's** user_id, which can differ from the
+account you automate with if the device was *shared* to your automation account. A
+shared account can still read the owner's records by passing the owner's user_id —
+set `feeder_owner_id` under `[feeder]` in your config (it's an account number, not a
+secret), or pass `--owner-id`. If you automate with the same account that owns the
+feeder, you don't need it at all.
+
+To find the owner's user_id: log in once as the owning account and print `ali_user_id`,
+or capture it from the app. It never changes.
 
 ## Findings
 
