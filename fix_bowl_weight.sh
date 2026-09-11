@@ -13,6 +13,7 @@
 # USAGE
 #   ./fix_bowl_weight.sh -e you@example.com -w 68             # prompts for password
 #   ./fix_bowl_weight.sh -e you@example.com -p 'pass' -w 68
+#   ./fix_bowl_weight.sh -e ... -w 68 -d WL0300...           # pick a device (if you have >1)
 #   ./fix_bowl_weight.sh -e ... -w 68 -v                      # verbose
 #   ./fix_bowl_weight.sh -e ... -w 68 -n                      # dry run: auth only
 #
@@ -258,11 +259,28 @@ IOTTOKEN=$(jq -r '.data.iotToken' <<<"$R5")
 RL=$(iot_call "$API" "uc/listBindingByAccount" '{}' "1.0.8" "$IOTTOKEN")
 if [[ -n $DEVICE ]]; then
   IOTID=$(jq -r --arg d "$DEVICE" '.data.data[]? | select(.deviceName==$d) | .iotId' <<<"$RL" | head -1)
+  [[ -z $IOTID || $IOTID == null ]] && { echo "no device named '$DEVICE' on this account." >&2
+    echo "devices found:" >&2
+    jq -r '.data.data[]? | "  \(.deviceName)  (\(.productName))"' <<<"$RL" >&2; exit 1; }
 else
-  IOTID=$(jq -r '.data.data[]? | select((.productName//""|ascii_downcase)|test("riko")) | .iotId' <<<"$RL" | head -1)
-  [[ -z $IOTID ]] && IOTID=$(jq -r '.data.data[0]?.iotId // empty' <<<"$RL")
+  # all Riko/feeder devices on the account
+  mapfile -t RIKOS < <(jq -r '.data.data[]? | select((.productName//""|ascii_downcase)|test("riko|feeder|pet")) | .deviceName' <<<"$RL")
+  if [[ ${#RIKOS[@]} -eq 0 ]]; then
+    # fall back to any single device
+    mapfile -t RIKOS < <(jq -r '.data.data[]?.deviceName' <<<"$RL")
+  fi
+  if [[ ${#RIKOS[@]} -eq 0 ]]; then
+    echo "no devices on this account: $RL" >&2; exit 1
+  elif [[ ${#RIKOS[@]} -gt 1 ]]; then
+    echo "This account has ${#RIKOS[@]} devices. Pick one with -d <device_name>:" >&2
+    jq -r '.data.data[]? | "  -d \(.deviceName)   (\(.productName))"' <<<"$RL" >&2
+    exit 2
+  fi
+  DEVICE="${RIKOS[0]}"
+  IOTID=$(jq -r --arg d "$DEVICE" '.data.data[]? | select(.deviceName==$d) | .iotId' <<<"$RL" | head -1)
 fi
-[[ -z $IOTID || $IOTID == null ]] && { echo "couldn't find device iotId: $RL" >&2; exit 1; }
+[[ -z $IOTID || $IOTID == null ]] && { echo "couldn't resolve iotId for $DEVICE" >&2; exit 1; }
+echo "targeting device: $DEVICE"
 vlog "iotId=$IOTID"
 
 RP=$(iot_call "$API" "thing/properties/get" \
