@@ -119,10 +119,49 @@ again.
 | `riko.py` | Full command-line control of the feeder: status, feed now, edit the schedule, set the tare, set the timezone, decode errors, recover a stalled pump. |
 | `monitor.py` + `notify.py` + `config.py` | A background monitor (systemd-friendly) that watches for missed feeds, pump stalls, clock drift, low food/water and **setting changes**, fixes the safe cases under hard caps, and pushes phone notifications via [ntfy](https://ntfy.sh). |
 | `neakasa.py` | Reads the intake ledger — per-meal actual-vs-planned grams, failure reasons, and eat sessions — from Neakasa's feeder backend. Self-sufficient: logs in with your account and needs the feeder owner's user_id (a number, not a secret). See "Intake history" below. |
+| `setup.sh` | Guided setup for the monitor — see below. Start here if you want more than the bowl-weight fix. |
 | `riko_discover.py`, `riko_tsl_probe.py`, `riko_trace.py`, `riko_poll.py`, `riko_pump_test.py` | Diagnostic scripts used to produce the findings. |
 
 `riko.py --help` and each script's header explain usage. Most read credentials from a
 `riko.toml` (see `config.py --example`) or `RIKO_EMAIL` / `RIKO_PASSWORD` env vars.
+
+---
+
+## Running the monitor
+
+The bowl-weight fix above is a one-off script. If you want ongoing monitoring — push
+notifications when a feed fails, a pump stalls, or something's wrong, with a few known
+issues fixed automatically — there's a guided setup for that too:
+
+```bash
+git clone https://github.com/<you>/riko-tools.git
+cd riko-tools
+./setup.sh
+```
+
+Same idea as `fix_bowl_weight.sh`: no arguments, no prior setup, just answer the
+prompts. It walks through:
+
+1. Creating a Python virtual environment and installing dependencies
+2. Your Neakasa login (stored locally in a `.env` file, same handling as the bowl fix)
+3. Finding your feeder on the account (auto-picks if you only have one)
+4. Writing a starter `riko.toml`
+5. A live test to confirm it can see your feeder
+6. **Optional:** installing it as a background service (`systemd`) that runs continuously,
+   with push notifications via [ntfy](https://ntfy.sh) — free, no account needed, you
+   just pick a topic name and subscribe to it in the ntfy app
+
+It's written for a Raspberry Pi running Raspberry Pi OS, but works on any Linux box with
+`systemd`. Safe to re-run — every step checks whether it's already done first.
+
+**The background service starts in `--dry-run` mode on purpose** — it'll detect problems
+and notify you, but won't change anything on the device until you turn that off. Give it
+a day or two to make sure it's telling you the right things, then remove `--dry-run` from
+the service file it created (`/etc/systemd/system/riko-monitor.service`) and restart it.
+
+If you'd rather set things up by hand instead of running `setup.sh`, `config.py` and the
+file table above have what you need — the script is just a shortcut through the same
+steps.
 
 ---
 
