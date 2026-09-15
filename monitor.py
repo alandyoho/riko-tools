@@ -48,13 +48,16 @@ from typing import Any
 
 from config import ConfigError, load as load_config
 from notify import Notifier, NotifyConfig
-from riko import ERROR_CODES, FeederState, FoodLevel, Riko, RikoStatus, WaterLevel
+from riko import ERROR_CODES, FeedCtrl, FeederState, FoodLevel, Riko, RikoStatus, WaterLevel
+from neakasa import Feeder as NeakasaFeeder
 
 log = logging.getLogger("riko.monitor")
 
 # error codes we will NEVER auto-remediate — mechanical, a retry could make it worse
 NEVER_RETRY = {10, 11, 13}          # grinder head missing / stalled / jammed
 PUMP_STALL = 70                     # the one we do handle
+BOWL_MISSING = 20                   # the other one we do handle: auto-resume once refilled
+BOWL_MISSING_DEBOUNCE_POLLS = 1     # consecutive "bowl is in" reads required before resuming
 
 
 # --------------------------------------------------------------------------- state
@@ -124,25 +127,99 @@ class Policy:
     daily_gram_ceiling: float = 60.0        # never let the day's PLANNED food exceed this
     max_remediations_per_day: int = 8
     max_unclog_per_slot: int = 1
+    max_bowl_tare_fixes_per_day: int = 10  # beyond this, stop auto-fixing and escalate
     missed_feed_grace_min: float = 6.0      # minutes past the expected serve before "missed"
     offline_after_min: float = 15.0         # no device report for this long -> offline
     killswitch: Path = field(default_factory=lambda: Path("riko_state/DISABLE_REMEDIATION"))
 
 
 # --------------------------------------------------------------------------- monitor
+# --- ledger fail_reason decoders --------------------------------------------
+# Pulled from the Android app's own source (FoodBinError.java,
+# DeliveryFoodResultAndPlanAdapter.java, FoodBinWorkState.java), not guessed.
+_ERR_CODE = {   # reason=2's resParam space (device errCode stream)
+    3: "leftover over threshold", 5: "stopped manually", 11: "grinder abnormal",
+    12: "cover not placed", 13: "food jammed", 20: "bowl not placed",
+    21: "bowl retrieval failed", 22: "bowl dispensing blocked", 30: "battery absent",
+    31: "DC power lost", 32: "battery low", 33: "battery temp too high",
+    40: "water low", 41: "water empty", 50: "freeze-dried food low",
+    51: "food empty", 60: "bowl overweight", 62: "weight calibration abnormal",
+    70: "water pump abnormal", 71: "water pump abnormal",
+}
+_WORK_STATE = {  # reason=4's resParam space
+    0: "Dormant", 1: "FoodPreparing", 2: "FoodDelivering", 3: "Pausing",
+    4: "Faulting", 5: "Sleeping", 6: "Protecting", 7: "Cleaning",
+}
+_FIXED_REASON = {1: "stopped manually", 3: "leftover food over threshold",
+                 5: "insufficient power"}
+
+
+def decode_fail_reason(fail_reason_json: str) -> str:
+    """Turn a raw ledger fail_reason JSON string into a human-readable line."""
+    try:
+        d = json.loads(fail_reason_json or "{}")
+    except (ValueError, TypeError):
+        return "unknown (unparseable fail_reason)"
+    reason, param = d.get("reason"), d.get("resParam")
+    if reason in _FIXED_REASON:
+        return _FIXED_REASON[reason]
+    if reason == 2:
+        return f"device fault: {_ERR_CODE.get(param, f'errCode {param}')}"
+    if reason == 4:
+        state = _WORK_STATE.get(param, f"state {param}")
+        return f"device busy (internal state stuck at '{state}')"
+    return f"unrecognized (reason={reason}, resParam={param})"
+
+
+# Feed slots are fixed; a ledger result only ever appears within minutes of one,
+# so there's nothing to learn the rest of the day. Gate the (comparatively
+# expensive) ledger poll to a window around each enabled slot, read live from the
+# device schedule so it tracks edits automatically.
+_LEDGER_WINDOW_MIN = 20  # +/- minutes around a scheduled slot to consider "near"
+
+
+def _near_a_feed_slot(st: RikoStatus, window_min: int = _LEDGER_WINDOW_MIN) -> bool:
+    plan = st._p("fdPlanStr")
+    if not plan:
+        return True  # can't read the schedule -> fail open, check anyway
+    try:
+        plan = json.loads(plan) if isinstance(plan, str) else plan
+    except (ValueError, TypeError):
+        return True
+    now = time.localtime()
+    now_sec = now.tm_hour * 3600 + now.tm_min * 60 + now.tm_sec
+    for slot_sec, enabled in zip(plan.get("time", []), plan.get("bEn", [])):
+        if not enabled:
+            continue
+        delta = abs(now_sec - slot_sec)
+        delta = min(delta, 86400 - delta)  # wrap across midnight
+        if delta <= window_min * 60:
+            return True
+    return False
+
+
 class Monitor:
     def __init__(self, riko: Riko, store: Store, notifier: Notifier,
-                 policy: Policy, tz_offset: int, dry_run: bool) -> None:
+                 policy: Policy, tz_offset: int, dry_run: bool,
+                 neakasa: NeakasaFeeder | None = None,
+                 feeder_owner_id: int | None = None,
+                 device_name: str | None = None,
+                 bowl_grams_target: int = 68) -> None:
         self.r = riko
         self.store = store
         self.n = notifier
         self.p = policy
         self.tz_offset = tz_offset
         self.dry_run = dry_run
+        self.neakasa = neakasa                # optional: enables check_ledger_failures
+        self.feeder_owner_id = feeder_owner_id
+        self.device_name = device_name
+        self.bowl_grams_target = bowl_grams_target
         self._last_state: FeederState | None = None
         self._offline_since: float | None = None
         self._warned_food = False
         self._warned_water = False
+        self._bowl_back_count = 0    # consecutive polls with bowl detected, while suspended-for-bowl
 
     # ---- helpers
     def _remediation_allowed(self, need_grams: float, planned_today: float) -> tuple[bool, str]:
@@ -168,7 +245,9 @@ class Monitor:
         self._check_levels(st)
         await self._check_state(st)
         await self._check_clock(st)
-        self._check_config_drift(st)
+        await self._check_config_drift(st, self.bowl_grams_target)
+        if self.neakasa is not None:
+            await self.check_ledger_failures(st)
 
     async def _handle_unreachable(self, exc: Exception) -> None:
         now = time.time()
@@ -210,6 +289,56 @@ class Monitor:
             self.n.action_needed("Feeder fault",
                                  f"Device in FAULT (param {st.state_param}). Needs a look.")
 
+    async def _handle_bowl_missing_suspension(self, st: RikoStatus, name: str, slot: str) -> None:
+        """Auto-resume a feed that's only paused because the bowl was missing.
+
+        Unlike other suspensions, "bowl is now present" is unambiguous confirmation
+        the blocking condition is gone — there's no real fault to diagnose, just a
+        forgotten bowl. Debounced: requires BOWL_MISSING_DEBOUNCE_POLLS consecutive
+        polls showing bowl_in=True before resuming, so a flickering sensor reading
+        during placement doesn't trigger a premature/false resume. Still respects
+        dry-run / kill switch / daily cap like every other auto-action.
+        """
+        if not st.bowl_in:
+            if self._bowl_back_count:
+                log.info("bowl missing again before debounce completed; resetting")
+            self._bowl_back_count = 0
+            self.n.action_needed(
+                f"Feeder waiting on bowl: {name}",
+                f"Slot {slot} is paused with no bowl on the tray. Put one back and "
+                f"I'll resume it automatically — or resume it yourself in the app."
+            )
+            return
+
+        self._bowl_back_count += 1
+        if self._bowl_back_count < BOWL_MISSING_DEBOUNCE_POLLS:
+            log.info("bowl detected (%d/%d polls), waiting to confirm before resuming",
+                     self._bowl_back_count, BOWL_MISSING_DEBOUNCE_POLLS)
+            return
+
+        allowed, why = self._remediation_allowed(0.0, 0.0)  # resuming, not dispensing anew
+        if not allowed:
+            self.n.action_needed(
+                "Bowl back, but not auto-resuming",
+                f"Slot {slot} still paused ({name}). Bowl detected, but auto-resume is "
+                f"held ({why}). Resume it yourself in the app."
+            )
+            return
+
+        try:
+            result = await self.r.feed_control(FeedCtrl.RESUME)
+            self.store.record_remediation(slot, "bowl_resume", "ok")
+            self.n.fyi("Feed auto-resumed",
+                      f"Bowl was back on the tray for slot {slot} — resumed automatically. "
+                      f"Device now {result.state.name if hasattr(result,'state') else result}.")
+        except Exception as exc:
+            self.store.record_remediation(slot, "bowl_resume", "failed")
+            self.n.action_needed("Auto-resume failed",
+                                 f"Bowl's back for slot {slot} but resuming it didn't take: "
+                                 f"{exc}. Resume it yourself in the app.")
+        finally:
+            self._bowl_back_count = 0
+
     async def _handle_suspension(self, st: RikoStatus) -> None:
         code = st.state_param
         name = ERROR_CODES.get(code, f"code {code}")
@@ -219,6 +348,10 @@ class Monitor:
             self.n.action_needed(f"Feeder stuck: {name}",
                                  "Mechanical fault — not auto-retrying. Please check the grinder.")
             return
+        if code == BOWL_MISSING:
+            await self._handle_bowl_missing_suspension(st, name, slot)
+            return
+
         if code != PUMP_STALL:
             self.n.action_needed(f"Feeder suspended: {name}",
                                  f"param {code}. Not a known auto-fixable case.")
@@ -252,20 +385,27 @@ class Monitor:
                                  f"unclog on slot {slot} didn't take: {exc}. "
                                  f"Reseat the tank and feed manually.")
 
-    def _check_config_drift(self, st: RikoStatus) -> None:
-        """Notify when a device setting changes.
+    async def _check_config_drift(self, st: RikoStatus, bowl_grams_target: int) -> None:
+        """Notify when a device setting changes; auto-correct the bowl tare specifically.
 
         Added after the bowl tare silently reverted from 68 g back to the factory 65 g
         on 2026-09-09, coinciding with a Neakasa app update — and nothing told us. The
         correction had been in place for two days. An owner who fixes a setting should
         find out when something puts it back.
 
-        Notify-only by design. Auto-reverting would mean fighting the app in a loop,
-        and we don't know which side "wins" or why. Surfacing it lets a human decide.
+        Every OTHER watched setting stays notify-only by design — auto-reverting a
+        schedule or freshness change would mean guessing which side "wins" without
+        knowing why it changed. The bowl tare is the one exception: its correct value
+        is known, stable, and configured (bowl_grams_target), the write is cheap and
+        low-risk, and unlike a genuine user-made schedule edit, a self-inflicted revert
+        is worth correcting automatically rather than waiting on a human to notice a
+        push notification and go run a script. Rate-limited on top of the normal
+        remediation policy — if it reverts more than max_bowl_tare_fixes_per_day times,
+        something is actively fighting us and we stop auto-fixing and escalate instead.
 
-        Changes you make yourself will also notify. That's intentional: a confirmation
-        that a schedule edit landed is useful, and it means an unexpected change stands
-        out against a familiar pattern.
+        Changes you make yourself will also notify (for every setting including bowl
+        tare). That's intentional: a confirmation that an edit landed is useful, and it
+        means an unexpected change stands out against a familiar pattern.
         """
         watched = {
             "bowl tare": _fmt(st.bowl_tare_g),
@@ -275,6 +415,7 @@ class Monitor:
             "child lock": _fmt(st._p("childLockOnOff")),
             "food sound": _fmt(st._p("feedAudCfg", {})),
         }
+        bowl_drifted = False
         for key, new in watched.items():
             old = self.store.get_setting(key)
             if old is None:
@@ -285,11 +426,159 @@ class Monitor:
             self.store.put_setting(key, new)
             self.store.record_setting_change(key, old, new)
             log.warning("setting changed: %s: %s -> %s", key, old, new)
+            if key == "bowl tare":
+                bowl_drifted = True
+                continue  # handled below, with its own message (auto-fix attempt)
             self.n.action_needed(
                 f"Setting changed: {key}",
                 f"{key} went from {old} to {new}.\n\n"
                 f"If that wasn't you, something else changed it — the app has been seen "
                 f"reverting the bowl tare to the factory value after an update.")
+
+        # Fire on the LIVE value being wrong, not just on a detected transition.
+        # bowl_drifted (set above) only catches the moment it CHANGES from the last
+        # baseline we stored — if the wrong value persists across polls (e.g. after
+        # a restart re-baselines while already drifted, or after we declined to fix
+        # due to the daily cap), old==new on every subsequent poll and bowl_drifted
+        # never gets set again, so the sustained-wrong-value case was silently never
+        # retried. Checking the live reading against the target directly, every
+        # pass, closes that gap — this is what was actually broken today, not a
+        # hang or stale read as it first appeared.
+        if int(st.bowl_tare_g) != bowl_grams_target:
+            await self._fix_bowl_tare_drift(bowl_grams_target)
+
+    async def _fix_bowl_tare_drift(self, target_g: int) -> None:
+        """Auto-correct the bowl tare, or explain once why we're not.
+
+        Called on every pass where the live tare != target (see _check_config_drift).
+        That's deliberate — it's what fixes the "stuck at the wrong value across many
+        polls" case. But it means this function can be entered every ~30s for as long
+        as the value stays wrong, so BOTH the "hit the daily cap" and the "policy says
+        no" outcomes need their own re-notify guard, or they'd spam identically to how
+        the cap message did before this fix (one real change, then the same escalation
+        text every single poll thereafter — that's the bug this fixes).
+
+        Guard: notify once per (reason, day), not once per poll. Re-notifies only if
+        the reason changes (e.g. cap -> policy-denied) or a new day starts.
+        """
+        today = time.strftime("%Y-%m-%d")
+        count_key = f"bowl_tare_fixes_{today}"
+        done_today = int(self.store.get_setting(count_key) or 0)
+        notified_key = f"bowl_tare_notified_{today}"
+        already_notified = self.store.get_setting(notified_key)
+
+        if done_today >= self.p.max_bowl_tare_fixes_per_day:
+            if already_notified != "cap":
+                self.n.action_needed(
+                    "Bowl tare keeps reverting — not auto-fixing again",
+                    f"Reverted and been auto-corrected {done_today} time(s) today already. "
+                    f"Something is actively resetting it (likely the Neakasa app syncing). "
+                    f"Fix it yourself with fix_bowl_weight.sh once you're done poking at the "
+                    f"app today, or it'll probably just revert again.\n\n"
+                    f"(You won't be re-notified about this again today unless it's fixed "
+                    f"and reverts yet again.)"
+                )
+                self.store.put_setting(notified_key, "cap")
+            return
+
+        allowed, why = self._remediation_allowed(0.0, 0.0)
+        if not allowed:
+            if already_notified != f"policy:{why}":
+                self.n.action_needed(
+                    "Bowl tare reverted — not auto-fixing",
+                    f"Held off ({why}). Run fix_bowl_weight.sh yourself if you want it "
+                    f"corrected now. (Won't repeat this notice while it stays held off "
+                    f"for the same reason.)"
+                )
+                self.store.put_setting(notified_key, f"policy:{why}")
+            return
+
+        # about to actually fix it -- clear the notify-guard so a FUTURE cap/policy
+        # hit (after this fix, if it reverts yet again) notifies fresh rather than
+        # being suppressed by a stale guard from earlier today.
+        self.store.put_setting(notified_key, "")
+
+        try:
+            # NOTE: deliberately r.set_bowl_weight_property(), NOT r.tare(). tare()
+            # calls resetScaleZero, which re-zeros the platform and — confirmed by
+            # testing — knocks the device into believing the bowl was removed
+            # (bowl_in=False, scale=0, food_in_bowl=None) with NO self-recovery; it
+            # needs a physical lift-and-reseat to start reporting again, same as the
+            # manual fixer script requires. set_bowl_weight_property() writes
+            # bowlGram directly alongside the current bBowlIn/curWeight, matching
+            # what the app itself appears to do on its own reverts — bowl stays
+            # detected, no disturbance needed. Confirmed via direct A/B test.
+            await self.r.set_bowl_weight_property(target_g)
+            self.store.put_setting(count_key, str(done_today + 1))
+            self.store.record_remediation("n/a", "bowl_tare_fix", "ok")
+            self.n.fyi(
+                "Bowl tare auto-corrected",
+                f"It had reverted; set it back to {target_g} g automatically "
+                f"({done_today + 1}/{self.p.max_bowl_tare_fixes_per_day} today)."
+            )
+        except Exception as exc:
+            self.store.record_remediation("n/a", "bowl_tare_fix", "failed")
+            self.n.action_needed(
+                "Bowl tare auto-fix failed",
+                f"Tried to correct it back to {target_g} g and it didn't take: {exc}. "
+                f"Run fix_bowl_weight.sh yourself."
+            )
+
+    async def check_ledger_failures(self, st: RikoStatus) -> None:
+        """Poll the intake ledger, but only within ~20 min of a scheduled feed slot
+        (see _near_a_feed_slot). Alerts once per newly-seen failed feed, decoded to
+        plain English via decode_fail_reason. Remembers the high-water mark of
+        feed_time we've already processed in the settings table, so restarts don't
+        cause duplicate alerts.
+
+        This is what added detection for `reason=4` ("device busy" / internal
+        work-state stuck) after we found a scheduled feed silently rejected with no
+        error anywhere else in the telemetry — see reason4-finding.md.
+        """
+        if not _near_a_feed_slot(st):
+            log.debug("ledger check: not near a feed slot, skipping")
+            return
+        try:
+            device = self.device_name or await self.neakasa.find_device()
+            ledger = await self.neakasa.ledger(device, days=1,
+                                               owner_user_id=self.feeder_owner_id)
+        except Exception as exc:
+            log.warning("ledger check failed: %s", exc)
+            return
+
+        last_seen_raw = self.store.get_setting("ledger_last_feed_time")
+        last_seen = int(last_seen_raw) if last_seen_raw else 0
+        newest = last_seen
+        new_failures = 0
+
+        for f in ledger.get("feed_list", []):
+            ft = f.get("feed_time", 0)
+            if ft <= last_seen:
+                continue
+            newest = max(newest, ft)
+            if f.get("status") == 1:
+                continue  # succeeded
+            new_failures += 1
+            reason_str = decode_fail_reason(f.get("fail_reason", ""))
+            when = time.strftime("%H:%M", time.localtime(ft))
+            way = f.get("way", "?")
+            plan = f"{f.get('plan_feed_weight')}g food / {f.get('plan_water_weight')}g water"
+            got = f"{f.get('feed_weight')}g / {f.get('water_weight')}g"
+            self.n.action_needed(
+                f"Feed failed at {when}",
+                f"{way} feed at {when} failed: {reason_str}\n"
+                f"Planned {plan}, delivered {got}.\n"
+                f"Check on the cat / consider a manual feed if this was scheduled."
+            )
+            log.warning("ledger: feed failure at %s way=%s %s", when, way, reason_str)
+
+        if new_failures:
+            log.info("ledger check: %d new failure(s) found and reported", new_failures)
+        else:
+            log.info("ledger check: ran near feed slot, no new failures")
+
+        if newest > last_seen:
+            self.store.put_setting("ledger_last_feed_time", str(newest))
 
     async def _check_clock(self, st: RikoStatus) -> None:
         """Verify the device's clock against real wall-clock time, using the device's
@@ -406,20 +695,34 @@ async def main() -> int:
     store = Store(cfg.state_dir / "monitor.db")
     policy = Policy(killswitch=cfg.state_dir / "DISABLE_REMEDIATION")
 
+    neakasa_client = None
+    if getattr(cfg, "feeder_owner_id", 0):
+        # optional: only enabled when a feeder_owner_id is configured. Uses the
+        # same [account] credentials as everything else — no second login needed.
+        neakasa_client = NeakasaFeeder(cfg.email, cfg.password)
+        await neakasa_client.__aenter__()
+
     async with Riko.from_config(cfg) as r:
-        mon = Monitor(r, store, notifier, policy, cfg.tz_offset, args.dry_run)
+        mon = Monitor(r, store, notifier, policy, cfg.tz_offset, args.dry_run,
+                      neakasa=neakasa_client,
+                      feeder_owner_id=getattr(cfg, "feeder_owner_id", None) or None,
+                      bowl_grams_target=cfg.bowl_grams)
         if args.dry_run:
             log.info("DRY RUN — detection and notification only, no remediation")
         if args.once:
             await mon.check()
             return 0
         log.info("monitor running, %.0fs interval", args.interval)
-        while True:
-            try:
-                await mon.check()
-            except Exception:
-                log.exception("check pass failed")
-            await asyncio.sleep(args.interval)
+        try:
+            while True:
+                try:
+                    await mon.check()
+                except Exception:
+                    log.exception("check pass failed")
+                await asyncio.sleep(args.interval)
+        finally:
+            if neakasa_client is not None:
+                await neakasa_client.__aexit__(None, None, None)
 
 
 if __name__ == "__main__":
