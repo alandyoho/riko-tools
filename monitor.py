@@ -351,12 +351,17 @@ class Monitor:
             return
 
         if code != PUMP_STALL:
+            log.info("suspension code=%s (%s) has no auto-fix path", code, name)
             self.n.action_needed(f"Feeder suspended: {name}",
                                  f"param {code}. Not a known auto-fixable case.")
             return
 
         # pump stall
+        log.info("pump stall detected: slot=%s state_param=%s", slot, code)
+
         if self.store.remediated_slot(slot, "unclog"):
+            log.warning("slot %s already auto-recovered once today; stalled again, "
+                        "not retrying (once-per-slot cap)", slot)
             self.n.action_needed("Pump stalled again",
                                  f"Already auto-recovered slot {slot} once today and it "
                                  f"stalled again. Manual attention: reseat the water tank.")
@@ -365,23 +370,40 @@ class Monitor:
         planned = _planned_food_today(st, self.tz_offset)
         allowed, why = self._remediation_allowed(8.0, planned)
         if not allowed:
+            log.info("auto-unclog for slot %s held off: %s", slot, why)
             self.n.action_needed("Pump stalled - not auto-fixing",
                                  f"{name}. Holding off ({why}). Run `riko unclog` yourself "
                                  f"if the cat needs the meal.")
             return
 
-        log.info("auto-unclog for slot %s (%s)", slot, name)
+        log.info("starting auto-unclog for slot %s (planned %.0fg food today so far)",
+                 slot, planned)
+        t0 = time.monotonic()
+        journal: list[dict[str, Any]] = []
         try:
-            journal: list[dict[str, Any]] = []
             result = await self.r.unclog(journal=journal)
+            elapsed = time.monotonic() - t0
+
+            # riko.py's unclog() already logs each step as it happens (its own `note()`
+            # helper). No need to repeat that detail here — what's missing is a single
+            # summary line tying the whole sequence together, since per-step lines are
+            # easy to lose in the scroll when reviewing after the fact.
+            step_names = " -> ".join(s.get("step", "?") for s in journal)
             self.store.record_remediation(slot, "unclog", "ok")
+            log.info("auto-unclog for slot %s SUCCEEDED in %.1fs, device now %s "
+                     "(%d steps: %s)", slot, elapsed, result.state.name, len(journal), step_names)
             self.n.fyi("Pump stall auto-cleared",
                        f"Primed and resumed slot {slot}. Device now {result.state.name}.")
         except Exception as exc:
+            elapsed = time.monotonic() - t0
             self.store.record_remediation(slot, "unclog", "failed")
+            got_to = journal[-1].get("step", "?") if journal else "before first step"
+            log.error("auto-unclog for slot %s FAILED after %.1fs, got as far as "
+                     "'%s' (%d steps completed): %s",
+                     slot, elapsed, got_to, len(journal), exc, exc_info=True)
             self.n.action_needed("Auto-recovery failed",
-                                 f"unclog on slot {slot} didn't take: {exc}. "
-                                 f"Reseat the tank and feed manually.")
+                                 f"unclog on slot {slot} didn't take (got to '{got_to}'): "
+                                 f"{exc}. Reseat the tank and feed manually.")
 
     async def _check_config_drift(self, st: RikoStatus, bowl_grams_target: int) -> None:
         """Notify when a device setting changes; auto-correct the bowl tare specifically.
