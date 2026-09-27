@@ -1,6 +1,7 @@
 .venv/
 .env
-.riko-session.json
+*.riko-session.json
+.riko-watch-session.json
 riko.toml
 riko_capture/
 __pycache__/
@@ -9,3 +10,5 @@ neakasa_decompiled/
 key-extraction-plan.md
 logs*.txt
 *.bak
+.riko-watch-session.json
+riko_state/

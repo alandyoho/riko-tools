@@ -10,8 +10,8 @@ drop — while you trigger feedings / open the app / etc.
 
 Usage:
     pip install neakasa-litterbox-sdk
-    export NEAKASA_EMAIL='you@example.com'
-    export NEAKASA_PASSWORD='...'
+    export RIKO_WATCH_EMAIL='you@example.com'   # a separate account, device shared to it
+    export RIKO_WATCH_PASSWORD='...'
     python3 riko_discover.py                 # snapshot + live watch
     python3 riko_discover.py --snapshot-only # just login + dump, then exit
     python3 riko_discover.py --poll 15       # also poll properties every 15s
@@ -47,7 +47,7 @@ from neakasa_litterbox_sdk import (
 )
 
 OUT = Path("riko_capture")
-SESSION_FILE = OUT / ".session.json"
+SESSION_FILE = Path(".riko-watch-session.json")  # separate account (alanyoh@gmail.com), deliberately isolated
 
 log = logging.getLogger("riko")
 
@@ -187,6 +187,17 @@ async def watch(client: NeakasaClient, snapshots: dict[str, dict[str, Any]],
                     await login(client)
                     continue
                 except Exception as exc:
+                    # Mirrors riko.py's _with_relogin: Aliyun 29003 = iotToken
+                    # invalid, often because another login on this account
+                    # (e.g. a one-off diagnostic script) replaced our session.
+                    # The SDK doesn't surface this as SessionExpiredError, so
+                    # detect it by message and recover the same way riko.py does
+                    # -- without this, a single collision kills the watcher
+                    # permanently instead of self-healing.
+                    if "29003" in str(exc):
+                        log.info("iotToken invalidated (29003); re-logging in")
+                        await login(client)
+                        continue
                     log.warning("poll failed for %s: %s", name, exc)
                     continue
                 changed = diff(old, new)
@@ -222,10 +233,16 @@ async def main() -> int:
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
-    email = os.environ.get("NEAKASA_EMAIL")
-    password = os.environ.get("NEAKASA_PASSWORD")
+    # Deliberately a SEPARATE account from monitor.py/oled_status.py's
+    # NEAKASA_EMAIL/PASSWORD. Running all long-lived services on one account
+    # caused a ~30s session-invalidation loop (Aliyun allows one live session
+    # per account; monitor.py's own poll/relogin cycle was kicking this
+    # watcher every cycle). The device is shared to this second account.
+    email = os.environ.get("RIKO_WATCH_EMAIL") or os.environ.get("NEAKASA_EMAIL")
+    password = os.environ.get("RIKO_WATCH_PASSWORD") or os.environ.get("NEAKASA_PASSWORD")
     if not email or not password:
-        print("Set NEAKASA_EMAIL and NEAKASA_PASSWORD in the environment.", file=sys.stderr)
+        print("Set RIKO_WATCH_EMAIL and RIKO_WATCH_PASSWORD in the environment "
+              "(falls back to NEAKASA_EMAIL/PASSWORD if unset).", file=sys.stderr)
         return 2
 
     OUT.mkdir(exist_ok=True)

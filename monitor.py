@@ -227,8 +227,6 @@ class Monitor:
             return False, "dry-run"
         if self.p.killswitch.exists():
             return False, "kill switch set"
-        if self.store.remediations_today() >= self.p.max_remediations_per_day:
-            return False, "daily remediation cap reached"
         if planned_today + need_grams > self.p.daily_gram_ceiling:
             return False, f"would exceed daily gram ceiling ({self.p.daily_gram_ceiling}g)"
         return True, ""
@@ -400,7 +398,7 @@ class Monitor:
         low-risk, and unlike a genuine user-made schedule edit, a self-inflicted revert
         is worth correcting automatically rather than waiting on a human to notice a
         push notification and go run a script. Rate-limited on top of the normal
-        remediation policy — if it reverts more than max_bowl_tare_fixes_per_day times,
+        remediation policy — reverts are corrected every time, no daily cap.
         something is actively fighting us and we stop auto-fixing and escalate instead.
 
         Changes you make yourself will also notify (for every setting including bowl
@@ -467,20 +465,6 @@ class Monitor:
         notified_key = f"bowl_tare_notified_{today}"
         already_notified = self.store.get_setting(notified_key)
 
-        if done_today >= self.p.max_bowl_tare_fixes_per_day:
-            if already_notified != "cap":
-                self.n.action_needed(
-                    "Bowl tare keeps reverting — not auto-fixing again",
-                    f"Reverted and been auto-corrected {done_today} time(s) today already. "
-                    f"Something is actively resetting it (likely the Neakasa app syncing). "
-                    f"Fix it yourself with fix_bowl_weight.sh once you're done poking at the "
-                    f"app today, or it'll probably just revert again.\n\n"
-                    f"(You won't be re-notified about this again today unless it's fixed "
-                    f"and reverts yet again.)"
-                )
-                self.store.put_setting(notified_key, "cap")
-            return
-
         allowed, why = self._remediation_allowed(0.0, 0.0)
         if not allowed:
             if already_notified != f"policy:{why}":
@@ -514,7 +498,7 @@ class Monitor:
             self.n.fyi(
                 "Bowl tare auto-corrected",
                 f"It had reverted; set it back to {target_g} g automatically "
-                f"({done_today + 1}/{self.p.max_bowl_tare_fixes_per_day} today)."
+                f"(fix #{done_today + 1} today)."
             )
         except Exception as exc:
             self.store.record_remediation("n/a", "bowl_tare_fix", "failed")
