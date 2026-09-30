@@ -291,3 +291,8 @@ schedule, or a power blip. Not a Riko problem but worth finding.
   16:00 meal ground early then showed a 6:50 countdown before serving. Note the
   soak setting is effectively a *minimum* — the real hold is whatever time is left
   between finishing the grind and the scheduled slot.
+- **2026-09-30 — Can the soak go past 10 min via the API?** No. The app caps it at
+  10 (`maxNum = 10` in `MixTimeSetFragment`). `defaults --soak 20` was accepted and
+  read back as 20, but the 15:55 meal still went PREPARING 15:45:01, SERVING
+  15:55:01 — identical to the 11:55 meal at soak 10. The device stores the value
+  but uses 10. Set back to 10.
