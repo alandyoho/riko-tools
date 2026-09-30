@@ -130,6 +130,7 @@ class Policy:
     max_bowl_tare_fixes_per_day: int = 10  # beyond this, stop auto-fixing and escalate
     missed_feed_grace_min: float = 6.0      # minutes past the expected serve before "missed"
     offline_after_min: float = 15.0         # no device report for this long -> offline
+    max_clock_syncs_per_day: int = 3        # beyond this, stop auto-syncing and escalate
     killswitch: Path = field(default_factory=lambda: Path("riko_state/DISABLE_REMEDIATION"))
 
 
@@ -243,6 +244,7 @@ class Monitor:
         self._check_levels(st)
         await self._check_state(st)
         await self._check_clock(st)
+        await self._check_schedule_drift(st)
         await self._check_config_drift(st, self.bowl_grams_target)
         if self.neakasa is not None:
             await self.check_ledger_failures(st)
@@ -635,6 +637,125 @@ class Monitor:
                        msg + f" Wrote base offset {base:+d} with dst=1 (device applies DST).")
         except Exception as exc:
             self.n.action_needed("Clock fix failed", f"{msg} set_timezone error: {exc}")
+
+
+    async def _check_schedule_drift(self, st: RikoStatus) -> None:
+        """Catch clock drift that _check_clock CAN'T see.
+
+        _check_clock only compares the device's timezone/DST-derived effective
+        offset against real time -- it's blind to fine-grained clock skew, since
+        the timezone config can be perfectly correct (zone=-5, dst=1) while the
+        device's underlying clock is simply running minutes behind or ahead. We
+        found exactly this on 2026-09-28: zone/DST config correct, device clock
+        29 minutes slow, so a 19:55 slot silently never fired -- no error, no
+        suspension, no ledger entry, nothing for any other check to catch. The
+        app showed "Expired"; nothing on our side did until this was added.
+
+        There's no live "what time does the device think it is" property to read
+        (the `timestamp` property is a stale one-time value from setup, confirmed
+        useless for this). So detection is indirect: if wall-clock time is past an
+        enabled slot by more than missed_feed_grace_min minutes and the ledger has
+        no record anywhere near that slot, the most likely explanation is clock
+        drift (as opposed to a real failure, which normally DOES leave a FAILED
+        ledger entry or a SUSPENDED state -- see check_ledger_failures and
+        _handle_suspension for those). Fix: call sync_time(), which the 2026-09-28
+        incident confirmed both corrects the clock AND makes the device
+        immediately fire the slot it had been sitting on.
+        """
+        if self.neakasa is None:
+            return  # needs the ledger to confirm a slot is truly unrecorded, not just quiet
+
+        plan = st._p("fdPlanStr")
+        if not plan:
+            return
+        try:
+            plan = json.loads(plan) if isinstance(plan, str) else plan
+        except (ValueError, TypeError):
+            return
+
+        now = time.localtime()
+        now_sec = now.tm_hour * 3600 + now.tm_min * 60 + now.tm_sec
+        grace_sec = self.p.missed_feed_grace_min * 60
+        overdue_slot = None
+        for slot_sec, enabled in zip(plan.get("time", []), plan.get("bEn", [])):
+            if not enabled:
+                continue
+            # only look at slots that have already passed today, within a sane
+            # lookback window (avoid matching a slot from ~24h ago after midnight)
+            if grace_sec < (now_sec - slot_sec) < grace_sec + 3600:
+                overdue_slot = slot_sec
+                break
+        if overdue_slot is None:
+            return
+
+        slot_label = time.strftime("%H:%M", time.gmtime(overdue_slot))
+        try:
+            device = self.device_name or await self.neakasa.find_device()
+            ledger = await self.neakasa.ledger(device, days=1,
+                                               owner_user_id=self.feeder_owner_id)
+        except Exception as exc:
+            log.warning("schedule-drift check: ledger fetch failed: %s", exc)
+            return
+
+        today = time.strftime("%Y-%m-%d")
+        found = False
+        for f in ledger.get("feed_list", []):
+            ft = time.localtime(f.get("feed_time", 0))
+            if time.strftime("%Y-%m-%d", ft) != today:
+                continue
+            f_sec = ft.tm_hour * 3600 + ft.tm_min * 60
+            if abs(f_sec - overdue_slot) < grace_sec + 300:  # small slack either side
+                found = True
+                break
+        if found:
+            return  # the slot has a record -- not a drift case, some other check owns it
+
+        today_key = f"clock_syncs_{today}"
+        done_today = int(self.store.get_setting(today_key) or 0)
+        notified_key = f"schedule_drift_notified_{today}"
+        already_notified = self.store.get_setting(notified_key)
+
+        if done_today >= self.p.max_clock_syncs_per_day:
+            if already_notified != "cap":
+                self.n.action_needed(
+                    "Slot overdue, repeated clock drift — not auto-syncing again",
+                    f"The {slot_label} slot is overdue with no ledger record, and "
+                    f"I've already auto-synced the clock {done_today} time(s) today. "
+                    f"Something may be causing the clock to drift repeatedly. Check "
+                    f"the device manually."
+                )
+                self.store.put_setting(notified_key, "cap")
+            return
+
+        allowed, why = self._remediation_allowed(0.0, 0.0)
+        if not allowed:
+            if already_notified != f"policy:{why}":
+                self.n.action_needed(
+                    "Slot overdue — not auto-syncing clock",
+                    f"The {slot_label} slot is overdue with no ledger record "
+                    f"(held off: {why}). This usually means the device's clock has "
+                    f"drifted. Trigger a manual feed if the cat needs it now."
+                )
+                self.store.put_setting(notified_key, f"policy:{why}")
+            return
+
+        self.store.put_setting(notified_key, "")
+        try:
+            await self.r.sync_time()
+            self.store.put_setting(today_key, str(done_today + 1))
+            self.n.fyi(
+                "Clock synced — slot was overdue",
+                f"The {slot_label} slot was overdue with no ledger record, likely "
+                f"clock drift (not a timezone/DST issue -- see the clock-drift check "
+                f"for that). Synced the device's clock; it should now fire the slot "
+                f"it was sitting on (sync #{done_today + 1} today)."
+            )
+        except Exception as exc:
+            self.n.action_needed(
+                "Clock sync failed",
+                f"The {slot_label} slot is overdue with no ledger record, tried "
+                f"sync_time() to fix it and it failed: {exc}. Check manually."
+            )
 
 
 # ---- slot math (planned intake + which slot we're in) ----------------------
