@@ -218,6 +218,7 @@ class Monitor:
         self.bowl_grams_target = bowl_grams_target
         self._last_state: FeederState | None = None
         self._offline_since: float | None = None
+        self._status_failures = 0    # consecutive failed status() calls
         self._warned_food = False
         self._warned_water = False
         self._bowl_back_count = 0    # consecutive polls with bowl detected, while suspended-for-bowl
@@ -240,6 +241,7 @@ class Monitor:
             await self._handle_unreachable(exc)
             return
         self._offline_since = None
+        self._status_failures = 0
 
         self._check_levels(st)
         await self._check_state(st)
@@ -251,9 +253,21 @@ class Monitor:
 
     async def _handle_unreachable(self, exc: Exception) -> None:
         now = time.time()
+        self._status_failures += 1
+        # %r, not %s: some SDK errors have an empty message (e.g. a timeout)
+        log.warning("status failed (%d in a row): %r", self._status_failures, exc)
+        # Riko._with_relogin only recovers from errors it recognizes. If failures
+        # keep coming, assume the session is broken and force a fresh login: on the
+        # 2nd failure in a row, then every 10th (~5 min at the default interval).
+        n = self._status_failures
+        if n == 2 or (n > 2 and n % 10 == 0):
+            try:
+                await self.r.relogin()
+                log.info("forced re-login after %d status failures", n)
+            except Exception as relogin_exc:
+                log.warning("forced re-login failed: %r", relogin_exc)
         if self._offline_since is None:
             self._offline_since = now
-            log.warning("status failed: %s", exc)
             return
         down_min = (now - self._offline_since) / 60
         if down_min >= self.p.offline_after_min:
@@ -548,10 +562,20 @@ class Monitor:
             return
         try:
             device = self.device_name or await self.neakasa.find_device()
-            ledger = await self.neakasa.ledger(device, days=1,
-                                               owner_user_id=self.feeder_owner_id)
+            try:
+                ledger = await self.neakasa.ledger(device, days=1,
+                                                   owner_user_id=self.feeder_owner_id)
+            except RuntimeError as exc:
+                # 1007 TokenInvalid = the shared session's REST token is stale
+                # (e.g. resumed from an old session file): fresh login, one retry
+                if "code=1007" not in str(exc):
+                    raise
+                log.info("ledger token rejected (1007); re-logging in")
+                await self.r.relogin()
+                ledger = await self.neakasa.ledger(device, days=1,
+                                                   owner_user_id=self.feeder_owner_id)
         except Exception as exc:
-            log.warning("ledger check failed: %s", exc)
+            log.warning("ledger check failed: %r", exc)
             return
 
         last_seen_raw = self.store.get_setting("ledger_last_feed_time")
@@ -822,17 +846,18 @@ async def main() -> int:
     store = Store(cfg.state_dir / "monitor.db")
     policy = Policy(killswitch=cfg.state_dir / "DISABLE_REMEDIATION")
 
-    neakasa_client = None
-    if getattr(cfg, "feeder_owner_id", 0):
-        # optional: only enabled when a feeder_owner_id is configured. Uses the
-        # same [account] credentials as everything else — no second login needed.
-        neakasa_client = NeakasaFeeder(cfg.email, cfg.password)
-        await neakasa_client.__aenter__()
-
     async with Riko.from_config(cfg) as r:
+        neakasa_client = None
+        if getattr(cfg, "feeder_owner_id", 0):
+            # optional: only enabled when a feeder_owner_id is configured. Shares
+            # Riko's client and session — a second login on the same account
+            # invalidates the first, and the two clients kicked each other out
+            # every poll near feed slots (2026-09-29).
+            neakasa_client = NeakasaFeeder(client=r.client)
         mon = Monitor(r, store, notifier, policy, cfg.tz_offset, args.dry_run,
                       neakasa=neakasa_client,
                       feeder_owner_id=getattr(cfg, "feeder_owner_id", None) or None,
+                      device_name=r.device.device_name,
                       bowl_grams_target=cfg.bowl_grams)
         if args.dry_run:
             log.info("DRY RUN — detection and notification only, no remediation")
@@ -840,16 +865,12 @@ async def main() -> int:
             await mon.check()
             return 0
         log.info("monitor running, %.0fs interval", args.interval)
-        try:
-            while True:
-                try:
-                    await mon.check()
-                except Exception:
-                    log.exception("check pass failed")
-                await asyncio.sleep(args.interval)
-        finally:
-            if neakasa_client is not None:
-                await neakasa_client.__aexit__(None, None, None)
+        while True:
+            try:
+                await mon.check()
+            except Exception:
+                log.exception("check pass failed")
+            await asyncio.sleep(args.interval)
 
 
 if __name__ == "__main__":

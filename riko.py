@@ -355,6 +355,34 @@ class Riko:
         if self._session_file and result is not cached:
             self._session_file.write_text(json.dumps(result.to_dict()))
 
+    async def relogin(self) -> None:
+        """Force a fresh full login, ignoring the cached session."""
+        await self._client.login()
+        self._save_session()
+
+    def _save_session(self) -> None:
+        if self._session_file and self._client.login_result:
+            self._session_file.write_text(json.dumps(self._client.login_result.to_dict()))
+
+    async def _ensure_session(self) -> None:
+        # A login that dies mid-handshake (e.g. connect.json times out) leaves the
+        # SDK holding a REST session with no iotToken. Every call after that fails
+        # with "IoT session not established", which is neither SessionExpiredError
+        # nor 29003, so nothing retried — monitor.py sat broken all night on
+        # 2026-09-29. login(cached=...) mints only the missing pieces.
+        current = self._client.login_result
+        if current is None or not current.iot_token:
+            log.info("no IoT session; completing login")
+            await self._client.login(cached=current)
+            self._save_session()
+
+    @property
+    def client(self) -> NeakasaClient:
+        """The underlying SDK client. Share it (e.g. neakasa.Feeder(client=...))
+        rather than logging in a second time: the account allows one live session,
+        so a second login knocks this one out."""
+        return self._client
+
     async def _resolve(self) -> Device:
         if self._device:
             return self._device
@@ -376,6 +404,7 @@ class Riko:
 
     # --- low-level -------------------------------------------------------
     async def _with_relogin(self, fn: Callable[[], Awaitable[Any]]) -> Any:
+        await self._ensure_session()
         try:
             return await fn()
         except SessionExpiredError:
@@ -387,9 +416,7 @@ class Riko:
             # handle it here with a full re-login and one retry.
             if "29003" in str(exc):
                 log.info("iotToken invalidated (29003); re-logging in")
-                await self._client.login()
-                if self._session_file and self._client.login_result:
-                    self._session_file.write_text(json.dumps(self._client.login_result.to_dict()))
+                await self.relogin()
                 return await fn()
             raise
 

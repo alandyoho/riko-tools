@@ -69,17 +69,33 @@ def _token(user_token: str, aes_key: str, aes_iv: str) -> str:
 
 
 class Feeder:
-    def __init__(self, email: str, password: str, region: str = "US"):
-        self._c = NeakasaClient(email=email, password=password, region=Region[region])
-        self._s = None
+    """Pass `client=` to reuse an already-logged-in NeakasaClient (e.g. Riko.client)
+    instead of logging in here. The account allows one live session, so two clients
+    in one process knock each other out every call (monitor.py, 2026-09-29)."""
+
+    def __init__(self, email: str | None = None, password: str | None = None,
+                 region: str = "US", *, client: NeakasaClient | None = None):
+        self._owns_client = client is None
+        self._c = client or NeakasaClient(email=email, password=password, region=Region[region])
 
     async def __aenter__(self):
-        await self._c.__aenter__()
-        self._s = await self._c.login()
+        if self._owns_client:
+            await self._c.__aenter__()
+            await self._c.login()
         return self
 
     async def __aexit__(self, *a):
-        await self._c.__aexit__(*a)
+        if self._owns_client:
+            await self._c.__aexit__(*a)
+
+    @property
+    def _s(self):
+        # read live, not cached at login: a re-login on the shared client replaces
+        # the user_token and aes key, and a stale copy gets code=1007 TokenInvalid
+        s = self._c.login_result
+        if s is None:
+            raise RuntimeError("not logged in")
+        return s
 
     @property
     def user_id(self) -> int:
