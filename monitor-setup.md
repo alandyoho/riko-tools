@@ -75,6 +75,14 @@ Then:
     sudo systemctl daemon-reload && sudo systemctl enable --now riko-monitor
     journalctl -u riko-monitor -f
 
+Also turn off Wi-Fi power saving on the Pi. With it on, the Pi drops off the network
+intermittently (SSH gets "No route to host"), and a drop in the middle of a login can
+fail it partway. This persists across reboots (NetworkManager) and applies now (iw):
+
+    printf '[connection]\nwifi.powersave = 2\n' | sudo tee /etc/NetworkManager/conf.d/wifi-powersave-off.conf
+    sudo /sbin/iw dev wlan0 set power_save off
+    /sbin/iw dev wlan0 get power_save    # should say: Power save: off
+
 ## 5. Start conservative
 
 Run it `--dry-run` (edit the ExecStart to add the flag) for a day or two first, so
