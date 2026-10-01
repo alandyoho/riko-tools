@@ -304,3 +304,14 @@ schedule, or a power blip. Not a Riko problem but worth finding.
   every poll while paused (the kill switch stops remediation, not alerts). Pausing at
   slot−30 s rather than earlier guarantees grind and water are done. Decided not to
   automate it in the monitor. One-off script: `~/riko-soak-test.py` on the Pi.
+- **2026-10-01 — Does the Wi-Fi → cellular takeover work?** Yes (`wifi_failover.py`,
+  SIM7600G-H + 1NCE SIM). `LFYTT-iot` switched off at ~15:18:50: takeover started
+  15:20:22 (90 s wait), hotspot up 15:20:27, feeder joined 15:20:29 and got
+  10.42.0.77, monitor logged back in over cellular 15:20:48. Wi-Fi back on ~15:23:50:
+  router seen in two scans, handed back 15:25:31, Pi on the home network 15:25:42,
+  feeder back at 192.168.1.77. 0.085 MB of cellular data for the 5-minute takeover.
+  Nine other devices on the SSID tried to join (~800 attempts) and were kicked each
+  time — on this chip hostapd's MAC allowlist disconnects them right after they
+  associate rather than refusing up front; none got an address. Scanning while
+  hosting (`iw scan ap-force`) works, so the "peek" fallback wasn't needed.
+  Not covered yet: router up but internet down, and power cuts (no Pi battery).

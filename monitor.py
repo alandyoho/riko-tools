@@ -475,7 +475,7 @@ class Monitor:
             if old is None:
                 self.store.put_setting(key, new)   # first run: establish the baseline
                 continue
-            if old == new:
+            if _same_setting(old, new):
                 continue
             self.store.put_setting(key, new)
             self.store.record_setting_change(key, old, new)
@@ -813,6 +813,18 @@ def _fmt(value: Any) -> str:
     if isinstance(value, (list, tuple)):
         return json.dumps(value, separators=(",", ":"), default=str)
     return str(value)
+
+
+def _same_setting(old: str, new: str) -> bool:
+    """True if two _fmt strings mean the same value. The device reports the same
+    number as 8 or 8.0 depending on who wrote it last (seen 2026-10-01 after an
+    edit in the app), which is not a change worth an alert."""
+    if old == new:
+        return True
+    try:
+        return json.loads(old) == json.loads(new)
+    except ValueError:
+        return False
 
 
 def _dst_active_now(tz: dict) -> bool:
