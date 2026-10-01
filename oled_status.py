@@ -5,6 +5,7 @@ cat mascot that twists (leans left/right) and bounces (up/down), with a
 speech bubble cycling through status lines tied to real device conditions.
 """
 import asyncio
+import json
 import time
 import board
 import busio
@@ -13,10 +14,14 @@ from PIL import Image, ImageDraw, ImageFont
 
 import sys
 sys.path.insert(0, "/home/yoho/riko")
-from riko import Riko
+from riko import RikoStatus
 from config import load as load_config
 
 REFRESH_SECONDS = 5
+# Status comes from the monitor's snapshot (riko_state/status.json), written each
+# pass. The display used to log in itself, which knocked the monitor's session out
+# (one live session per account) and could get stuck half-logged-in.
+STALE_SECONDS = 120   # monitor writes every ~30 s; older than this = monitor not running
 ROTATE_SECONDS = 2
 JUST_FIXED_DISPLAY_SECONDS = 15
 
@@ -126,9 +131,14 @@ def render(icon_x: int, icon_y: int, message: str, frame: int, fixing: bool) -> 
 
 _tare_state = {"was_wrong": False, "just_fixed_until": 0.0}
 
-async def get_status_messages(riko: Riko) -> list[str]:
+def get_status_messages(status_path) -> list[str]:
     try:
-        st = await riko.status()
+        snap = json.loads(status_path.read_text())
+        if time.time() - snap["ts"] > STALE_SECONDS:
+            return ["Uh oh...", "monitor isn't updating"]
+        if snap.get("error"):
+            return ["Uh oh...", snap["error"][:24]]
+        st = RikoStatus(snap["raw"])
         state_name = st.state.name
         param = st._p("deviceState", {}).get("param", 0)
         tare_ok = st.bowl_tare_g == 68
@@ -170,20 +180,18 @@ async def get_status_messages(riko: Riko) -> list[str]:
         return ["Uh oh...", str(exc)[:24]]
 
 async def main():
-    cfg = load_config()
-    cfg.require_credentials()
-    async with Riko.from_config(cfg) as riko:
-        messages = await get_status_messages(riko)
-        last_poll = time.monotonic()
-        idx = 0
-        while True:
-            render(icon_x=6, icon_y=6, message=messages[idx % len(messages)],
-                   frame=idx, fixing=False)
-            idx += 1
-            await asyncio.sleep(ROTATE_SECONDS)
-            if time.monotonic() - last_poll > REFRESH_SECONDS:
-                messages = await get_status_messages(riko)
-                last_poll = time.monotonic()
+    status_path = load_config().state_dir / "status.json"
+    messages = get_status_messages(status_path)
+    last_poll = time.monotonic()
+    idx = 0
+    while True:
+        render(icon_x=6, icon_y=6, message=messages[idx % len(messages)],
+               frame=idx, fixing=False)
+        idx += 1
+        await asyncio.sleep(ROTATE_SECONDS)
+        if time.monotonic() - last_poll > REFRESH_SECONDS:
+            messages = get_status_messages(status_path)
+            last_poll = time.monotonic()
 
 if __name__ == "__main__":
     asyncio.run(main())

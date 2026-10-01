@@ -205,8 +205,10 @@ class Monitor:
                  neakasa: NeakasaFeeder | None = None,
                  feeder_owner_id: int | None = None,
                  device_name: str | None = None,
-                 bowl_grams_target: int = 68) -> None:
+                 bowl_grams_target: int = 68,
+                 status_path: Path | None = None) -> None:
         self.r = riko
+        self.status_path = status_path        # optional: snapshot for oled_status.py
         self.store = store
         self.n = notifier
         self.p = policy
@@ -238,8 +240,10 @@ class Monitor:
         try:
             st = await self.r.status()
         except Exception as exc:
+            self._write_status_snapshot(error=repr(exc))
             await self._handle_unreachable(exc)
             return
+        self._write_status_snapshot(raw=st.raw)
         self._offline_since = None
         self._status_failures = 0
 
@@ -250,6 +254,19 @@ class Monitor:
         await self._check_config_drift(st, self.bowl_grams_target)
         if self.neakasa is not None:
             await self.check_ledger_failures(st)
+
+    def _write_status_snapshot(self, raw: dict | None = None, error: str | None = None) -> None:
+        """Publish the latest status for oled_status.py, so the display doesn't
+        need its own login (a second login on the account knocks ours out)."""
+        if self.status_path is None:
+            return
+        snap = {"ts": time.time(), "raw": raw, "error": error}
+        tmp = self.status_path.with_suffix(".tmp")
+        try:
+            tmp.write_text(json.dumps(snap))
+            tmp.replace(self.status_path)
+        except OSError as exc:
+            log.warning("status snapshot write failed: %r", exc)
 
     async def _handle_unreachable(self, exc: Exception) -> None:
         now = time.time()
@@ -701,8 +718,13 @@ class Monitor:
         now_sec = now.tm_hour * 3600 + now.tm_min * 60 + now.tm_sec
         grace_sec = self.p.missed_feed_grace_min * 60
         overdue_slot = None
-        for slot_sec, enabled in zip(plan.get("time", []), plan.get("bEn", [])):
-            if not enabled:
+        times = plan.get("time", [])
+        day_en = plan.get("bDayEn") or [1] * len(times)
+        for slot_sec, enabled, today in zip(times, plan.get("bEn", []), day_en):
+            # bDayEn=0 means skipped for today in the app (it resets to 1 at
+            # midnight, and stays 1 both when a slot fires and when drift makes
+            # it miss) — a skipped slot is expected to have no ledger record
+            if not enabled or not today:
                 continue
             # only look at slots that have already passed today, within a sane
             # lookback window (avoid matching a slot from ~24h ago after midnight)
@@ -858,7 +880,8 @@ async def main() -> int:
                       neakasa=neakasa_client,
                       feeder_owner_id=getattr(cfg, "feeder_owner_id", None) or None,
                       device_name=r.device.device_name,
-                      bowl_grams_target=cfg.bowl_grams)
+                      bowl_grams_target=cfg.bowl_grams,
+                      status_path=cfg.state_dir / "status.json")
         if args.dry_run:
             log.info("DRY RUN — detection and notification only, no remediation")
         if args.once:
