@@ -22,6 +22,7 @@ REFRESH_SECONDS = 5
 # pass. The display used to log in itself, which knocked the monitor's session out
 # (one live session per account) and could get stuck half-logged-in.
 STALE_SECONDS = 120   # monitor writes every ~30 s; older than this = monitor not running
+FAILOVER_STALE_SECONDS = 700   # ...but only every 5 min while on cellular backup
 ROTATE_SECONDS = 2
 JUST_FIXED_DISPLAY_SECONDS = 15
 
@@ -134,7 +135,8 @@ _tare_state = {"was_wrong": False, "just_fixed_until": 0.0}
 def get_status_messages(status_path) -> list[str]:
     try:
         snap = json.loads(status_path.read_text())
-        if time.time() - snap["ts"] > STALE_SECONDS:
+        on_cellular = status_path.with_name("FAILOVER").exists()   # wifi_failover.py takeover
+        if time.time() - snap["ts"] > (FAILOVER_STALE_SECONDS if on_cellular else STALE_SECONDS):
             return ["Uh oh...", "monitor isn't updating"]
         if snap.get("error"):
             return ["Uh oh...", snap["error"][:24]]
@@ -156,6 +158,9 @@ def get_status_messages(status_path) -> list[str]:
         cover_present = st._p("bCoverAbsent", 1)  # inverted name: 1=on, 0=off
 
         alerts = []
+        if on_cellular:
+            alerts.append("Wifi's down! I'm on")
+            alerts.append("cellular backup")
         if state_name == "SUSPENDED" and param in SUSPEND_VOICE:
             alerts.append(SUSPEND_VOICE[param])
             alerts.append(f"(error {param})")

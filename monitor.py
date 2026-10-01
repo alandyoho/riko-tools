@@ -58,6 +58,7 @@ NEVER_RETRY = {10, 11, 13}          # grinder head missing / stalled / jammed
 PUMP_STALL = 70                     # the one we do handle
 BOWL_MISSING = 20                   # the other one we do handle: auto-resume once refilled
 BOWL_MISSING_DEBOUNCE_POLLS = 1     # consecutive "bowl is in" reads required before resuming
+FAILOVER_INTERVAL_S = 300           # poll this slowly while on cellular backup (wifi_failover.py)
 
 
 # --------------------------------------------------------------------------- state
@@ -888,12 +889,16 @@ async def main() -> int:
             await mon.check()
             return 0
         log.info("monitor running, %.0fs interval", args.interval)
+        failover_flag = cfg.state_dir / "FAILOVER"   # set by wifi_failover.py during a takeover
         while True:
             try:
                 await mon.check()
             except Exception:
                 log.exception("check pass failed")
-            await asyncio.sleep(args.interval)
+            # every poll over cellular spends the SIM's small data allowance
+            on_cellular = failover_flag.exists()
+            await asyncio.sleep(max(args.interval, FAILOVER_INTERVAL_S) if on_cellular
+                                else args.interval)
 
 
 if __name__ == "__main__":
