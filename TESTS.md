@@ -296,3 +296,11 @@ schedule, or a power blip. Not a Riko problem but worth finding.
   read back as 20, but the 15:55 meal still went PREPARING 15:45:01, SERVING
   15:55:01 — identical to the 11:55 meal at soak 10. The device stores the value
   but uses 10. Set back to 10.
+- **2026-09-30 — Can pausing a scheduled meal extend the soak?** Yes. 19:55 slot at
+  soak 10: PREPARING 19:45:02; `feedCtrl PAUSE` at 19:54:30 → SUSPENDED (param 5),
+  food held; `RESUME` at 20:04:30 → SERVING 20:04:31, IDLE 20:04:37. ~19.5 min soak,
+  full 8 g / 56 g delivered. Side effects: the ledger records it as failed ("stopped
+  manually") despite full delivery, and the monitor alerts "Feeder suspended: code 5"
+  every poll while paused (the kill switch stops remediation, not alerts). Pausing at
+  slot−30 s rather than earlier guarantees grind and water are done. Decided not to
+  automate it in the monitor. One-off script: `~/riko-soak-test.py` on the Pi.
