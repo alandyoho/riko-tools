@@ -842,9 +842,25 @@ async def _cli() -> int:
                 slots[i] = replace(slots[i], enabled=args.schedule_cmd == "enable")
 
             await r.set_schedule(slots)
-            await asyncio.sleep(2)
-            print("written — device now reports:\n")
-            show((await r.status()).schedule)
+            # The device applies fdPlanStr asynchronously (a few seconds after the
+            # cloud accepts the /thing/properties/set). Re-reading immediately shows
+            # the OLD plan, so poll until the reported schedule matches what we wrote
+            # (or give up and say so) rather than printing stale state as "written".
+            def _key(sl: list[FeedSlot]) -> list:
+                return [(s.enabled, s.seconds_from_midnight, s.food_g, s.water_g) for s in sl]
+            want = _key(slots)
+            current = slots
+            applied = False
+            for _ in range(8):
+                await asyncio.sleep(2)
+                current = (await r.status()).schedule
+                if _key(current) == want:
+                    applied = True
+                    break
+            print("written — device now reports:\n" if applied else
+                  "WARNING: device has not confirmed the new schedule yet "
+                  "(it applies asynchronously). Last read:\n")
+            show(current)
         elif args.cmd == "defaults":
             cur = (await r.status()).default_feed
             if args.food is None and args.water is None and args.soak is None:
