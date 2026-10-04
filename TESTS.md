@@ -315,3 +315,14 @@ schedule, or a power blip. Not a Riko problem but worth finding.
   associate rather than refusing up front; none got an address. Scanning while
   hosting (`iw scan ap-force`) works, so the "peek" fallback wasn't needed.
   Not covered yet: router up but internet down, and power cuts (no Pi battery).
+- **2026-10-04 — Does the relay work when the router is up but the internet is
+  down?** No. Simulated with `riko_state/SIMULATE_INTERNET_DOWN` (real internet
+  still up). The Pi detected it, brought cellular up and alerted at 19:30:55, and
+  handed back cleanly at 19:36:00 after the switch was removed. But the kernel's
+  forwarded-packet count stayed at 0 for the whole relay and the only cellular
+  traffic (~15 KB) was the Pi's own: the feeder kept sending to the router. No send
+  errors were logged; whether the router dropped the redirect or the feeder ignored
+  it is unknown. The relay is now off by default (`RIKO_FAILOVER_RELAY=1` enables
+  it); the hotspot takeover is unaffected. Alternative not pursued for now: have
+  Pi-hole hand the feeder the Pi as gateway/DNS, which makes the feeder depend on
+  the Pi all the time.

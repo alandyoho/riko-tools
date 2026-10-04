@@ -21,6 +21,10 @@ addresses and nftables does the NAT to the modem.
             and tells the feeder (only the feeder) that the Pi is its gateway
             and DNS server (ARP redirection), then forwards it over cellular.
             Ends when the internet works through the router again.
+            OFF by default (RIKO_FAILOVER_RELAY=1 enables it): in the live test
+            on 2026-10-04 the Pi entered and left the relay cleanly but forwarded
+            nothing — the feeder kept using the router — so it would only raise a
+            misleading "on cellular backup" alert.
 
 The SIM has a small lifetime data allowance, so during a takeover:
   * only allowlisted devices can join, and only the feeder's MAC is forwarded;
@@ -29,7 +33,8 @@ The SIM has a small lifetime data allowance, so during a takeover:
   * riko-watch is stopped and the monitor slows down (riko_state/FAILOVER flag);
   * an episode that uses more than EPISODE_CAP_MB cuts cellular and alerts.
 
-Does NOT cover a power cut (the Pi has no battery yet).
+Does NOT cover a power cut (the Pi has no battery yet), or — while the relay
+is off — the router being up with no internet.
 
 Runs as root (nmcli/nft). Set up with failover-setup.sh.
   python3 wifi_failover.py            # run forever (systemd)
@@ -76,6 +81,7 @@ CHECK_S = 15                  # main loop tick
 DOWN_BEFORE_TAKEOVER_S = 90   # home SSID must be gone this long before taking over
 RETURN_SCAN_S = 60            # how often to look for the real router during a takeover
 RETURN_CONFIRMATIONS = 2      # consecutive scans that must see it before handing back
+RELAY_ENABLED = os.environ.get("RIKO_FAILOVER_RELAY", "0") == "1"   # see the docstring
 INTERNET_DOWN_BEFORE_RELAY_S = 120   # router up, internet dead this long before relaying
 INTERNET_PROBES = ("1.1.1.1", "8.8.8.8")
 RELAY_DNS = "8.8.8.8"         # where the feeder's (and our) DNS goes during a relay
@@ -480,7 +486,7 @@ class Failover:
         if not self.active:
             if wlan_connection() == HOME_CON:
                 self.down_since = None
-                if self.internet_ok():
+                if not RELAY_ENABLED or self.internet_ok():
                     self.internet_down_since = None
                     return
                 self.internet_down_since = self.internet_down_since or now
@@ -584,8 +590,8 @@ def main() -> int:
         log.error("RIKO_FEEDER_MAC is not set"); return 2
     cleanup(flag)   # never start half inside a takeover left by a crash or reboot
     fo = Failover(cfg.state_dir, Notifier(NotifyConfig.from_sources(cfg)))
-    log.info("watching %r; feeder %s; takeover after %ds down", fo.ssid, FEEDER_MAC,
-             DOWN_BEFORE_TAKEOVER_S)
+    log.info("watching %r; feeder %s; takeover after %ds down; relay %s", fo.ssid, FEEDER_MAC,
+             DOWN_BEFORE_TAKEOVER_S, "on" if RELAY_ENABLED else "off")
     while True:
         try:
             fo.tick()
