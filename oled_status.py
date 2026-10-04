@@ -24,6 +24,7 @@ REFRESH_SECONDS = 5
 STALE_SECONDS = 120   # monitor writes every ~30 s; older than this = monitor not running
 FAILOVER_STALE_SECONDS = 700   # ...but only every 5 min while on cellular backup
 ROTATE_SECONDS = 2
+FLIP_180 = True       # the display is mounted upside down
 JUST_FIXED_DISPLAY_SECONDS = 15
 
 i2c = busio.I2C(board.SCL, board.SDA)
@@ -127,7 +128,7 @@ def render(icon_x: int, icon_y: int, message: str, frame: int, fixing: bool) -> 
         draw.text((bubble_x0 + 4, bubble_y0 + 3 + i * 11), line, font=font, fill=1)
 
     oled.fill(0)
-    oled.image(image)
+    oled.image(image.rotate(180) if FLIP_180 else image)
     oled.show()
 
 _tare_state = {"was_wrong": False, "just_fixed_until": 0.0}
