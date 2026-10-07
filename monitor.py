@@ -349,6 +349,12 @@ class Monitor:
         if bowl is None:
             log.info("top-up %s: no bowl reading in the ledger; leaving the meal alone", label)
             return
+        if topup.handled_since_meal(bowl, st.reported_at("bowlStatus")):
+            # the ledger goes quiet after the bowl is taken off or put back (topup.py)
+            msg = f"bowl was handled since the last meal (ledger says {bowl.grams:.0f} g); leaving the meal alone"
+            self.store.record_remediation(label, "topup_observe", msg)
+            log.info("top-up %s: %s", label, msg)
+            return
         self._stale_food_check(bowl)
         food, water = plan["food"][i], plan["water"][i]
         decision = topup.plan_topup(food, water, bowl.grams)
@@ -401,7 +407,11 @@ class Monitor:
             # still before the feeder starts preparing: if the bowl has been emptied
             # since we decided (washed, or the cat finally ate), put the full meal back
             bowl = await self._bowl()
-            if bowl is not None and topup.plan_topup(*pending["orig"], bowl.grams).action == "full":
+            if bowl is None:
+                return
+            if topup.handled_since_meal(bowl, st.reported_at("bowlStatus")):
+                await self._topup_restore(plan, pending, "the bowl was taken off or put back")
+            elif topup.plan_topup(*pending["orig"], bowl.grams).action == "full":
                 await self._topup_restore(plan, pending, f"the bowl was emptied ({bowl.grams:.0f} g left)")
             return
         served = pending["saw_cycle"] and now >= slot + 60

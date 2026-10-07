@@ -19,6 +19,14 @@ Where the numbers come from (Neakasa's intake ledger, see neakasa.py):
 So the bowl's contents now are simply the most recent of those readings.
 Checked against 70 meals: the leftover computed this way matched what the
 feeder weighed at the next serving to within 5 g in 63 of them.
+
+One blind spot: when the bowl is taken off the tray and put back, the feeder
+stops logging 10-minute eating windows until the next meal starts preparing
+(seen 2026-10-07: a bowl put back at 08:00 with 75 g, eaten some time before
+11:45, with nothing reported in between). After the bowl has been handled the
+ledger can't be trusted, so handled_since_meal() tells monitor.py to leave the
+next meal alone. Lifting a full bowl off also gets logged as the cat "eating"
+it, which inflates Neakasa's intake totals but not these readings.
 """
 
 from __future__ import annotations
@@ -35,6 +43,7 @@ class Bowl:
     grams: float              # in the bowl now
     as_of: int                # unix time of the reading it comes from
     emptied_at: int | None    # last time the bowl was (near) empty; None if not seen in the ledger
+    last_feed_at: int = 0     # when the feeder last put anything in the bowl
 
 
 def bowl_now(ledger: dict[str, Any]) -> Bowl | None:
@@ -50,8 +59,11 @@ def bowl_now(ledger: dict[str, Any]) -> Bowl | None:
 
     grams: float | None = None
     as_of = 0
+    last_feed_at = 0
     emptied_at: int | None = None
     for ts, kind, rec in events:
+        if kind == 0:
+            last_feed_at = ts
         if kind == 1:
             grams = float(rec.get("left_weight", 0))
         elif rec.get("left_weight", 0) > 0:
@@ -68,7 +80,17 @@ def bowl_now(ledger: dict[str, Any]) -> Bowl | None:
             emptied_at = ts
     if grams is None:
         return None
-    return Bowl(grams=grams, as_of=as_of, emptied_at=emptied_at)
+    return Bowl(grams=grams, as_of=as_of, emptied_at=emptied_at, last_feed_at=last_feed_at)
+
+
+HANDLED_GRACE_S = 120   # a scale report this soon after a feed is the feed itself
+
+
+def handled_since_meal(bowl: Bowl, scale_reported_at: float | None) -> bool:
+    """True if the feeder's scale reported after the last feed. On firmware 0033 the
+    scale only reports when the bowl is taken off, put back or nudged (91 reports
+    in two weeks: 39 bowl-off, 32 bowl-on, 20 re-weighs, none tied to a serving)."""
+    return scale_reported_at is not None and scale_reported_at > bowl.last_feed_at + HANDLED_GRACE_S
 
 
 @dataclass(frozen=True)
