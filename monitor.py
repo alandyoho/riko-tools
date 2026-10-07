@@ -38,8 +38,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import json
 import logging
+import os
 import sqlite3
 import time
 from dataclasses import dataclass, field
@@ -48,8 +50,10 @@ from typing import Any
 
 from config import ConfigError, load as load_config
 from notify import Notifier, NotifyConfig
-from riko import ERROR_CODES, FeedCtrl, FeederState, FoodLevel, Riko, RikoStatus, WaterLevel
+from riko import (ERROR_CODES, FeedCtrl, FeederState, FoodLevel, Riko, RikoStatus, WaterLevel,
+                  parse_schedule)
 from neakasa import Feeder as NeakasaFeeder
+import topup
 
 log = logging.getLogger("riko.monitor")
 
@@ -132,6 +136,13 @@ class Policy:
     missed_feed_grace_min: float = 6.0      # minutes past the expected serve before "missed"
     offline_after_min: float = 15.0         # no device report for this long -> offline
     max_clock_syncs_per_day: int = 3        # beyond this, stop auto-syncing and escalate
+    # top-up (see topup.py): "on" rewrites the next meal, "observe" only logs what it
+    # would do, "off" does nothing
+    topup_mode: str = "observe"
+    topup_lead_min: tuple[float, float] = (12.0, 16.0)   # decide this long before the slot
+    topup_prep_lead_min: float = 10.5       # the feeder starts preparing 10 min before the slot
+    topup_backstop_min: float = 30.0        # restore this long after the slot if no serving was seen
+    stale_food_hours: float = 12.0          # alert when the bowl hasn't been emptied for this long
     killswitch: Path = field(default_factory=lambda: Path("riko_state/DISABLE_REMEDIATION"))
 
 
@@ -255,6 +266,213 @@ class Monitor:
         await self._check_config_drift(st, self.bowl_grams_target)
         if self.neakasa is not None:
             await self.check_ledger_failures(st)
+            await self._check_topup(st)
+
+    # ---- top-up: shrink the next meal by what is still in the bowl ---------------
+    def _topup_pending(self) -> dict | None:
+        raw = self.store.get_setting("topup_pending")
+        try:
+            return json.loads(raw) if raw else None
+        except ValueError:
+            return None
+
+    def _topup_set_pending(self, pending: dict | None) -> None:
+        self.store.put_setting("topup_pending", json.dumps(pending) if pending else "")
+
+    @staticmethod
+    def _schedule_plan(st: RikoStatus) -> dict | None:
+        plan = st._p("fdPlanStr")
+        try:
+            plan = json.loads(plan) if isinstance(plan, str) else plan
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(plan, dict) or not all(isinstance(plan.get(k), list) for k in ("time", "food", "water")):
+            return None
+        return plan
+
+    async def _write_schedule(self, plan: dict) -> None:
+        """Write the schedule and move the config-drift baseline with it, so our own
+        change doesn't raise a "Setting changed: schedule" alert."""
+        await self.r.set_schedule_raw(plan)
+        slots = parse_schedule(json.dumps(plan))
+        self.store.put_setting("schedule", _fmt([(s.hhmm, s.food_g, s.water_g, s.enabled) for s in slots]))
+
+    async def _bowl(self) -> "topup.Bowl | None":
+        device = self.device_name or await self.neakasa.find_device()
+        ledger = await self.neakasa.ledger(device, days=2, owner_user_id=self.feeder_owner_id)
+        return topup.bowl_now(ledger)
+
+    async def _check_topup(self, st: RikoStatus) -> None:
+        """Before each meal, serve only what the bowl is missing (see topup.py).
+
+        About 15 minutes before a slot — the feeder starts preparing 10 minutes
+        before — read what is left in the bowl and rewrite that slot's food and water
+        to the difference, or mark it skipped for today if the bowl already holds a
+        meal. Once the meal has been served (or 30 minutes after the slot) the
+        original amounts go back. The originals are saved before anything is written,
+        so a restart mid-way still restores them.
+        """
+        if self.p.topup_mode == "off":
+            return
+        plan = self._schedule_plan(st)
+        if plan is None:
+            return
+        pending = self._topup_pending()
+        try:
+            if pending:
+                await self._topup_follow_up(st, plan, pending)
+            else:
+                await self._topup_decide(st, plan)
+        except Exception as exc:
+            log.warning("top-up check failed: %r", exc)
+
+    async def _topup_decide(self, st: RikoStatus, plan: dict) -> None:
+        lt = time.localtime()
+        now_sec = lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec
+        lo, hi = (m * 60 for m in self.p.topup_lead_min)
+        day_en = plan.get("bDayEn") or [1] * len(plan["time"])
+        for i, slot_sec in enumerate(plan["time"]):
+            if not (plan.get("bEn") or [1] * len(plan["time"]))[i] or not day_en[i]:
+                continue
+            if lo <= (slot_sec - now_sec) % 86400 <= hi:
+                break
+        else:
+            return
+        slot_epoch = int(time.time()) + (slot_sec - now_sec) % 86400
+        label = time.strftime("%H:%M", time.gmtime(slot_sec))
+        if self.store.get_setting("topup_last_eval") == f"{_today()} {label}":
+            return                                    # already decided for this slot
+        if st.state != FeederState.IDLE:
+            return                                    # asleep on battery, suspended, mid-meal
+        bowl = await self._bowl()
+        self.store.put_setting("topup_last_eval", f"{_today()} {label}")
+        if bowl is None:
+            log.info("top-up %s: no bowl reading in the ledger; leaving the meal alone", label)
+            return
+        self._stale_food_check(bowl)
+        food, water = plan["food"][i], plan["water"][i]
+        decision = topup.plan_topup(food, water, bowl.grams)
+        summary = (f"{bowl.grams:.0f} g in the bowl, meal is {food:g}+{water:g} g -> " +
+                   (f"serve {decision.food_g}+{decision.water_g} g" if decision.action == "topup"
+                    else decision.action))
+        observe = self.p.topup_mode != "on" or self.dry_run or self.p.killswitch.exists()
+        self.store.record_remediation(label, "topup_observe" if observe else "topup_decision", summary)
+        if decision.action == "full":
+            log.info("top-up %s: %s", label, summary)
+            return
+        if observe:
+            log.info("top-up %s (observe only): %s", label, summary)
+            return
+        new_plan = copy.deepcopy(plan)
+        if decision.action == "skip":
+            new_plan.setdefault("bDayEn", [1] * len(plan["time"]))[i] = 0
+        else:
+            new_plan["food"][i], new_plan["water"][i] = decision.food_g, decision.water_g
+        pending = {"slot_sec": slot_sec, "slot_epoch": slot_epoch, "label": label,
+                   "action": decision.action, "orig": [food, water],
+                   "new": [decision.food_g, decision.water_g], "leftover": bowl.grams,
+                   "saw_cycle": False}
+        self._topup_set_pending(pending)              # saved first: a crash after the write still restores
+        try:
+            await self._write_schedule(new_plan)
+        except Exception:
+            self._topup_set_pending(None)
+            raise
+        log.warning("top-up %s: %s", label, summary)
+        if decision.action == "skip":
+            self.n.fyi(f"{label} meal skipped — bowl still full",
+                       f"{bowl.grams:.0f} g is still in the bowl, as much as the {food + water:g} g "
+                       f"meal, so the {label} meal is skipped for today.")
+        else:
+            self.n.fyi(f"{label} meal topped up",
+                       f"{bowl.grams:.0f} g is still in the bowl, so the {label} meal will be "
+                       f"{decision.food_g} g food + {decision.water_g} g water instead of "
+                       f"{food:g} + {water:g}. The schedule goes back to normal after it is served.")
+
+    async def _topup_follow_up(self, st: RikoStatus, plan: dict, pending: dict) -> None:
+        now = time.time()
+        slot, label = pending["slot_epoch"], pending["label"]
+        if st.state in (FeederState.PREPARING, FeederState.SERVING):
+            if not pending["saw_cycle"]:
+                pending["saw_cycle"] = True
+                self._topup_set_pending(pending)
+            return                                    # never touch the schedule mid-meal
+        if now < slot - self.p.topup_prep_lead_min * 60:
+            # still before the feeder starts preparing: if the bowl has been emptied
+            # since we decided (washed, or the cat finally ate), put the full meal back
+            bowl = await self._bowl()
+            if bowl is not None and topup.plan_topup(*pending["orig"], bowl.grams).action == "full":
+                await self._topup_restore(plan, pending, f"the bowl was emptied ({bowl.grams:.0f} g left)")
+            return
+        served = pending["saw_cycle"] and now >= slot + 60
+        if pending["action"] == "skip":
+            served = now >= slot + 120                # nothing is served; the flag clears itself at midnight
+        if not served and now < slot + self.p.topup_backstop_min * 60:
+            return
+        if st.state != FeederState.IDLE and now < slot + 2 * 3600:
+            return                                    # suspended or faulted: wait for it to settle
+        await self._topup_restore(plan, pending, "meal served" if pending["saw_cycle"] else "slot has passed")
+        if pending["action"] == "skip":
+            bowl = await self._bowl()
+            if bowl is not None and bowl.grams <= topup.EMPTY_G:
+                self.n.action_needed(
+                    f"{label} meal was skipped, but the bowl is empty now",
+                    f"The bowl held {pending['leftover']:.0f} g when the {label} meal was skipped and "
+                    f"reads {bowl.grams:.0f} g now. Consider a manual feed.")
+
+    async def _topup_restore(self, plan: dict, pending: dict, why: str) -> None:
+        label = pending["label"]
+        try:
+            i = plan["time"].index(pending["slot_sec"])
+        except ValueError:
+            i = None                                  # the slot was moved or deleted in the app
+        result = "nothing to restore"
+        try:
+            if i is not None and pending["action"] == "topup":
+                if [plan["food"][i], plan["water"][i]] == pending["new"]:
+                    back = copy.deepcopy(plan)
+                    back["food"][i], back["water"][i] = pending["orig"]
+                    await self._write_schedule(back)
+                    result = "restored"
+                else:
+                    result = "left alone (edited in the app since)"
+            elif i is not None and time.time() < pending["slot_epoch"]:
+                day_en = plan.get("bDayEn") or []
+                if i < len(day_en) and not day_en[i]:  # un-skip: only before the slot, never after
+                    back = copy.deepcopy(plan)
+                    back["bDayEn"][i] = 1
+                    await self._write_schedule(back)
+                    result = "un-skipped"
+        except Exception as exc:
+            log.warning("top-up %s: restore failed (%r); will retry", label, exc)
+            if time.time() > pending["slot_epoch"] + 3 * 3600 and not pending.get("alerted"):
+                pending["alerted"] = True
+                self._topup_set_pending(pending)
+                self.n.action_needed(
+                    f"Couldn't restore the {label} meal",
+                    f"It was changed to {pending['new'][0]}+{pending['new'][1]} g for a top-up and "
+                    f"should be {pending['orig'][0]:g}+{pending['orig'][1]:g} g. Fix it in the app.")
+            return
+        self._topup_set_pending(None)
+        self.store.record_remediation(label, "topup", "ok")
+        log.info("top-up %s: %s — %s", label, result, why)
+
+    def _stale_food_check(self, bowl: "topup.Bowl") -> None:
+        if bowl.grams <= topup.EMPTY_G:
+            return
+        since = bowl.emptied_at
+        hours = None if since is None else (time.time() - since) / 3600
+        if hours is not None and hours < self.p.stale_food_hours:
+            return
+        key = str(since) if since is not None else _today()
+        if self.store.get_setting("topup_stale_alerted") == key:
+            return
+        self.store.put_setting("topup_stale_alerted", key)
+        age = "more than 2 days" if hours is None else f"{hours:.0f} hours"
+        self.n.action_needed(
+            "Food has been sitting in the bowl",
+            f"The bowl has not been empty for {age} and holds {bowl.grams:.0f} g. "
+            f"The feeder can't clear it — dump and rinse the bowl.")
 
     def _write_status_snapshot(self, raw: dict | None = None, error: str | None = None) -> None:
         """Publish the latest status for oled_status.py, so the display doesn't
@@ -879,7 +1097,8 @@ async def main() -> int:
 
     notifier = Notifier(NotifyConfig.from_sources(cfg))
     store = Store(cfg.state_dir / "monitor.db")
-    policy = Policy(killswitch=cfg.state_dir / "DISABLE_REMEDIATION")
+    policy = Policy(killswitch=cfg.state_dir / "DISABLE_REMEDIATION",
+                    topup_mode=os.environ.get("RIKO_TOPUP", "observe").lower())
 
     async with Riko.from_config(cfg) as r:
         neakasa_client = None
@@ -900,7 +1119,8 @@ async def main() -> int:
         if args.once:
             await mon.check()
             return 0
-        log.info("monitor running, %.0fs interval", args.interval)
+        log.info("monitor running, %.0fs interval; top-up %s", args.interval,
+                 policy.topup_mode if neakasa_client else "off (needs the ledger)")
         failover_flag = cfg.state_dir / "FAILOVER"   # set by wifi_failover.py during a takeover
         while True:
             try:
