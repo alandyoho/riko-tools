@@ -111,11 +111,66 @@ again.
 
 ---
 
+## More water per meal: set the ratio past the app's 1:5 limit
+
+**The problem:** the app won't let you add more than 5 g of water for each gram of food.
+For some cats that isn't enough water. **The limit is in the app, not the feeder** — the
+feeder accepts more. Ours has run at 1:7 (8 g food / 56 g water per meal) since
+2026-09-29 and its own records show the full amount delivered. In our case, smaller meals
+plus more water seems to have stopped our cat throwing up after meals.
+
+**The fix:** a small script sets the water for every meal to food × the ratio you choose.
+
+### How to run it
+
+If you've never used a terminal, follow steps 2–4 of the bowl-weight walkthrough above
+(download, open Terminal, go to the folder). Then type this and press Enter:
+
+```
+bash set_water_ratio.sh
+```
+
+There is nothing else to type on that line — the script has no options, on purpose. It
+then **walks you through it, one step at a time:**
+
+- Asks for your **Neakasa email and password**, the same as the bowl-weight fix (hidden
+  as you type, only sent to Neakasa, never saved).
+- If you have **more than one feeder**, lets you pick with the arrow keys.
+- Shows **your meals as they are now**: time, food, water and ratio for each.
+- Asks **how many grams of water per gram of food** you want. Anything from 1 to 10; one
+  decimal is fine (6.5).
+- Shows **your meals as they would be afterwards**, so you can check every number.
+- Changes nothing unless you type **`yes`**. Anything else cancels.
+- Reads the meals back from the feeder to confirm the change took.
+
+It only changes **water** amounts — for every scheduled meal, and for the default meal
+that "feed now" uses. Food amounts, meal times and everything else are left alone. It
+applies from the next meal.
+
+**To undo it:** run it again and enter `5`, or edit the meals in the app.
+
+### Good to know
+
+- **More water means a fuller bowl.** The script shows the fullest meal in grams before
+  you confirm; make sure your bowl holds it. It refuses anything over the feeder's own
+  limit of 600 g of water per meal.
+- **Editing a meal in the app puts that meal back to 1:5 at most.** The other meals keep
+  their ratio. After editing meals in the app, run the script again.
+- **Rehydration (soak) time** is a separate setting, and that one is in the app:
+  Settings → Rehydration time. The maximum is 10 minutes. The feeder will store a longer
+  value sent to it directly, but it still soaks for 10.
+- Logging in from the script may sign the Neakasa app out on your phone; just log back in.
+- macOS or Linux; needs `curl`, `openssl`, `jq`, `xxd` (it offers to install any that are
+  missing). Windows: use WSL or Git Bash.
+
+---
+
 ## What else is here
 
 | File | What it does |
 |---|---|
 | `fix_bowl_weight.sh` / `.py` | The bowl-weight fix above. |
+| `set_water_ratio.sh` | The water-ratio change above. |
 | `riko.py` | Full command-line control of the feeder: status, feed now, edit the schedule, set the tare, set the timezone, decode errors, recover a stalled pump. |
 | `monitor.py` + `notify.py` + `config.py` | A background monitor (systemd-friendly) that watches for missed feeds, pump stalls, clock drift, low food/water and **setting changes**, fixes the safe cases under hard caps, and pushes phone notifications via [ntfy](https://ntfy.sh). |
 | `neakasa.py` | Reads the intake ledger — per-meal actual-vs-planned grams, failure reasons, and eat sessions — from Neakasa's feeder backend. Self-sufficient: logs in with your account and needs the feeder owner's user_id (a number, not a secret). See "Intake history" below. |
