@@ -326,3 +326,31 @@ schedule, or a power blip. Not a Riko problem but worth finding.
   it); the hotspot takeover is unaffected. Alternative not pursued for now: have
   Pi-hole hand the feeder the Pi as gateway/DNS, which makes the feeder depend on
   the Pi all the time.
+- **2026-10-07 — How much of a meal is left when the next one is due?** It's
+  either eaten or ignored. Ledger, 74 meals from 2026-09-24 (feed records only carry
+  `left_weight`, the bowl contents after serving, from firmware 0033): 64 had ≤25%
+  left, 3 had 25–50%, none had 50–75%, 7 had ≥75%. Six of those seven were the 23:55
+  or 03:55 meal. Ignored meals stack: 141 g in the bowl on 10-02, 91 g on 10-07.
+  Eaten meals get their first bite within 100 min in 90% of cases. Untouched bowls
+  read the same 4 h later (no evaporation drift). Leftover computed from the ledger
+  matched what the feeder weighed at the next serving within 5 g in 63 of 70.
+- **2026-10-07 — Does taking the bowl off distort the records?** Yes, three ways.
+  (1) Lifting a full bowl off is logged as the cat eating it (10-02 08:21, ~141 g in
+  the bowl, 74 g logged "eaten"; 10-07 07:54, ~88 g, 74 g logged); about 9% of all
+  grams logged as eaten since 09-24 overlap a bowl removal. (2) After the bowl is
+  taken off and put back, the feeder logs no eating until the next meal starts
+  preparing (10-07: back on at 08:00 with 75 g, nothing reported until 11:45).
+  (3) `bowlStatus` only reports on handling: 91 reports in two weeks were 39 bowl-off,
+  32 bowl-on, 20 re-weighs, none tied to a serving — so a scale report after the
+  last feed is a reliable "bowl was handled" signal.
+- **2026-10-08 — Is the ledger current enough to decide 15 min before a meal?** Yes.
+  First night in observe mode, four decisions: readings of 0, 66 and 0 g against 1,
+  66 and 5 g weighed by the feeder at serving (the fourth was a handled bowl).
+  Eating that ended at 07:15 was in the ledger by the 07:39 decision.
+- **2026-10-09 — Is a schedule change made ~15 min before a meal used for that
+  meal?** Yes — first live top-up. The 03:55 meal (3+21) sat untouched; at 07:39 the
+  monitor read 28 g, rewrote the 07:55 slot from 8+56 to 4+28, the feeder served
+  4+28, and the slot was restored at 07:56. The scale read 59 g of food at 07:55:42
+  (28 + 32 = 60). The feed record's own `left_weight` said 70 g — 10 g high, cause
+  unknown. So: a rewrite 16 min ahead is honored, and a 4 g scheduled portion works.
+  Not yet seen live: the skip path, portions of 1–2 g, the 12-hour stale-food alert.

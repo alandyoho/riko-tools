@@ -171,6 +171,8 @@ applies from the next meal.
 |---|---|
 | `fix_bowl_weight.sh` / `.py` | The bowl-weight fix above. |
 | `set_water_ratio.sh` | The water-ratio change above. |
+| `topup.py` | The arithmetic behind the monitor's meal top-up — see "Stop meals stacking up" below. |
+| `wifi_failover.py` + `failover-setup.sh` | Optional, needs a cellular modem on the Pi: when the home Wi-Fi disappears, the Pi becomes a hotspot with the same name and routes the feeder over cellular. Details in the script headers. |
 | `riko.py` | Full command-line control of the feeder: status, feed now, edit the schedule, set the tare, set the timezone, decode errors, recover a stalled pump. |
 | `monitor.py` + `notify.py` + `config.py` | A background monitor (systemd-friendly) that watches for missed feeds, pump stalls, clock drift, low food/water and **setting changes**, fixes the safe cases under hard caps, and pushes phone notifications via [ntfy](https://ntfy.sh). |
 | `neakasa.py` | Reads the intake ledger — per-meal actual-vs-planned grams, failure reasons, and eat sessions — from Neakasa's feeder backend. Self-sufficient: logs in with your account and needs the feeder owner's user_id (a number, not a secret). See "Intake history" below. |
@@ -217,6 +219,54 @@ the service file it created (`/etc/systemd/system/riko-monitor.service`) and res
 If you'd rather set things up by hand instead of running `setup.sh`, `config.py` and the
 file table above have what you need — the script is just a shortcut through the same
 steps.
+
+### Stop meals stacking up when one is skipped (top-up)
+
+**The problem:** the feeder serves every scheduled meal in full, on top of whatever is
+still in the bowl. If the cat sleeps through the midnight and 4 am meals, breakfast lands
+on both of them — we found bowls holding 91 g and 141 g in the morning.
+
+**What the monitor does about it:** about 15 minutes before each meal it reads how much is
+left in the bowl, then:
+
+- **Under 10 g left:** nothing. The meal is served as scheduled.
+- **Some left:** it rewrites that one meal to serve only the difference, at the meal's own
+  food-to-water ratio. With 28 g left before an 8 g + 56 g meal, the feeder serves
+  4 g + 28 g.
+- **A full meal's worth left:** it marks that meal "skip today" (the same flag the app
+  uses, which clears itself at midnight).
+
+Once the meal has been served — or 30 minutes after the slot — it puts the original
+amounts back. The originals are saved before anything is changed, so a restart mid-way
+still restores them. You get a low-priority notification each time it changes a meal.
+
+**It stands back when it can't trust the reading:**
+
+- If the bowl has been taken off or put back since the last meal, the scheduled meal is
+  served as normal. (After the bowl is handled, the feeder stops reporting what is in it
+  until the next meal starts.)
+- If the bowl is emptied, or swapped, after a change was made but before the feeder
+  starts preparing, the full meal goes back.
+- If you edit that meal in the app in the meantime, your edit is left alone.
+- If the Pi is offline or the records can't be read, nothing is changed.
+
+It also notifies you when food has been sitting in the bowl for 12 hours — the feeder
+can't clear the bowl itself.
+
+**Turning it on.** It needs the intake ledger (see "Intake history" below). It starts in
+observe-only mode: it logs what it would do before each meal and changes nothing. After
+a day of that looking right, add this line to the `.env` file and restart the service:
+
+```
+RIKO_TOPUP=on
+```
+
+`RIKO_TOPUP=off` disables it. The monitor's kill switch (`riko_state/DISABLE_REMEDIATION`)
+and `--dry-run` both put it back to observe-only without a restart.
+
+**Limits:** food is served in whole grams, so a top-up lands within a few grams of a full
+bowl, not exactly on it. It only knows grams, so water left from a water-only manual feed
+counts as leftover. Old food stays under the new food — hence the 12-hour notification.
 
 ---
 
