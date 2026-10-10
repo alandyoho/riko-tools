@@ -25,7 +25,7 @@ REFRESH_SECONDS = 5
 STALE_SECONDS = 120   # monitor writes every ~30 s; older than this = monitor not running
 FAILOVER_STALE_SECONDS = 700   # ...but only every 5 min while on cellular backup
 ROTATE_SECONDS = 2
-FLIP_180 = True       # the display is mounted upside down
+FLIP_180 = False      # set True if the display is mounted upside down
 JUST_FIXED_DISPLAY_SECONDS = 15
 
 i2c = busio.I2C(board.SCL, board.SDA)
