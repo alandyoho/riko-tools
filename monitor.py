@@ -145,7 +145,7 @@ class Policy:
     topup_backstop_min: float = 30.0        # restore this long after the slot if no serving was seen
     stale_food_hours: float = 12.0          # alert when the bowl hasn't been emptied for this long
     # battery backup (power.py); power_guard.py takes over at its own critical voltage
-    power_alert_after_s: float = 120.0      # on battery this long before "power is out"
+    power_alert_after_s: float = 60.0       # on battery this long before "power is out"
     battery_low_v: float = 3.55             # "battery low" alert at or below this, on battery
     killswitch: Path = field(default_factory=lambda: Path("riko_state/DISABLE_REMEDIATION"))
 
