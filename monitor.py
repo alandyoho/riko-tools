@@ -53,6 +53,7 @@ from notify import Notifier, NotifyConfig
 from riko import (ERROR_CODES, FeedCtrl, FeederState, FoodLevel, Riko, RikoStatus, WaterLevel,
                   parse_schedule)
 from neakasa import Feeder as NeakasaFeeder
+import power
 import topup
 
 log = logging.getLogger("riko.monitor")
@@ -143,6 +144,9 @@ class Policy:
     topup_prep_lead_min: float = 10.5       # the feeder starts preparing 10 min before the slot
     topup_backstop_min: float = 30.0        # restore this long after the slot if no serving was seen
     stale_food_hours: float = 12.0          # alert when the bowl hasn't been emptied for this long
+    # battery backup (power.py); power_guard.py takes over at its own critical voltage
+    power_alert_after_s: float = 120.0      # on battery this long before "power is out"
+    battery_low_v: float = 3.55             # "battery low" alert at or below this, on battery
     killswitch: Path = field(default_factory=lambda: Path("riko_state/DISABLE_REMEDIATION"))
 
 
@@ -233,6 +237,9 @@ class Monitor:
         self._last_state: FeederState | None = None
         self._offline_since: float | None = None
         self._status_failures = 0    # consecutive failed status() calls
+        self._on_battery_since: float | None = None
+        self._power_alerted = False  # "power is out" has gone out for this outage
+        self._battery_low_alerted = False
         self._warned_food = False
         self._warned_water = False
         self._bowl_back_count = 0    # consecutive polls with bowl detected, while suspended-for-bowl
@@ -248,7 +255,43 @@ class Monitor:
         return True, ""
 
     # ---- the pass
+    def _check_power(self) -> None:
+        """Alert when the Pi itself is on its backup battery, when that battery gets
+        low, and when wall power is back. Runs before anything that needs the network:
+        in a power cut the router is usually down too, so a failed send is retried on
+        every pass until it gets out (over cellular once wifi_failover.py has taken over)."""
+        ups = power.read_ups()
+        if ups is None:
+            return                              # no UPS fitted
+        now = time.time()
+        if not ups.on_battery:
+            if self._power_alerted:
+                mins = (now - self._on_battery_since) / 60 if self._on_battery_since else 0
+                if not self.n.fyi("Power is back — Pi on wall power again",
+                                  f"The Pi ran on its battery for about {mins:.0f} min. The battery "
+                                  f"is at {ups.volts:.2f} V (~{ups.percent}%) and recharging."):
+                    return                      # couldn't send; say so next pass
+            self._on_battery_since, self._power_alerted, self._battery_low_alerted = None, False, False
+            return
+        self._on_battery_since = self._on_battery_since or now
+        if not self._power_alerted and now - self._on_battery_since >= self.p.power_alert_after_s:
+            left = f" Roughly {ups.minutes_left} min of battery at the present draw." if ups.minutes_left else ""
+            self._power_alerted = self.n.action_needed(
+                "Power is out — Pi running on battery",
+                f"The Pi lost wall power and is on its backup battery ({ups.volts:.2f} V, "
+                f"~{ups.percent}%).{left} The feeder has its own battery, but it sleeps on "
+                f"battery and may miss scheduled meals.")
+        if self._power_alerted and not self._battery_low_alerted and ups.volts <= self.p.battery_low_v:
+            self._battery_low_alerted = self.n.action_needed(
+                "Pi battery low",
+                f"The backup battery is down to {ups.volts:.2f} V (~{ups.percent}%). The Pi will "
+                f"stop monitoring and protect its disk soon; it restarts when power returns.")
+
     async def check(self) -> None:
+        try:
+            self._check_power()
+        except Exception as exc:
+            log.warning("power check failed: %r", exc)
         try:
             st = await self.r.status()
         except Exception as exc:

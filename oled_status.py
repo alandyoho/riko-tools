@@ -15,6 +15,7 @@ from PIL import Image, ImageDraw, ImageFont
 import sys
 sys.path.insert(0, "/home/yoho/riko")
 from riko import RikoStatus
+import power
 from config import load as load_config
 
 REFRESH_SECONDS = 5
@@ -134,6 +135,17 @@ def render(icon_x: int, icon_y: int, message: str, frame: int, fixing: bool) -> 
 _tare_state = {"was_wrong": False, "just_fixed_until": 0.0}
 
 def get_status_messages(status_path) -> list[str]:
+    """Battery state first (the Pi's own backup battery), then the feeder's status."""
+    if status_path.with_name("SAFE_IDLE").exists():      # power_guard.py: battery nearly empty
+        return ["Battery's nearly out.", "Resting till power's", "back. See you soon!"]
+    ups = power.read_ups()
+    if ups is not None and ups.on_battery:
+        left = f", ~{ups.minutes_left}min" if ups.minutes_left else ""
+        return ["Power's out! I'm on", f"battery {ups.percent}%{left}"] + _feeder_messages(status_path)
+    return _feeder_messages(status_path)
+
+
+def _feeder_messages(status_path) -> list[str]:
     try:
         snap = json.loads(status_path.read_text())
         on_cellular = status_path.with_name("FAILOVER").exists()   # wifi_failover.py takeover

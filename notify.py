@@ -46,9 +46,10 @@ class Notifier:
     def __init__(self, config: NotifyConfig) -> None:
         self.config = config
 
-    def _ntfy(self, title: str, body: str, priority: str, tags: str) -> None:
+    def _ntfy(self, title: str, body: str, priority: str, tags: str) -> bool:
+        """True if the push went out (or no topic is configured, so there is nothing to retry)."""
         if not self.config.ntfy_topic:
-            return
+            return True
         url = f"{self.config.ntfy_server.rstrip('/')}/{self.config.ntfy_topic}"
         # HTTP headers are latin-1 only; keep the Title ASCII-safe and let the
         # emoji come from Tags (ntfy renders tag names as icons). The body is UTF-8.
@@ -59,13 +60,15 @@ class Notifier:
         )
         try:
             urllib.request.urlopen(req, timeout=10)
+            return True
         except Exception as exc:  # never let a failed notification break the monitor
             log.warning("ntfy send failed: %s", exc)
+            return False
 
-    def action_needed(self, title: str, body: str) -> None:
+    def action_needed(self, title: str, body: str) -> bool:
         log.warning("ACTION NEEDED: %s — %s", title, body)
-        self._ntfy(title, body, priority="high", tags="warning,rotating_light")
+        return self._ntfy(title, body, priority="high", tags="warning,rotating_light")
 
-    def fyi(self, title: str, body: str) -> None:
+    def fyi(self, title: str, body: str) -> bool:
         log.info("FYI: %s — %s", title, body)
-        self._ntfy(title, body, priority="low", tags="information_source")
+        return self._ntfy(title, body, priority="low", tags="information_source")
