@@ -93,6 +93,29 @@ def handled_since_meal(bowl: Bowl, scale_reported_at: float | None) -> bool:
     return scale_reported_at is not None and scale_reported_at > bowl.last_feed_at + HANDLED_GRACE_S
 
 
+def unexplained_extra(ledger: dict[str, Any], feed: dict[str, Any]) -> tuple[float, float, int] | None:
+    """For one feed record: grams in the bowl after serving that neither the
+    leftover nor the amounts the feeder says it served account for.
+
+    Returns (extra_g, bowl_before_g, previous_feed_time), or None if it can't be
+    worked out. Over 100 meals the extra is normally 0-3 g; on 2026-10-11 a meal
+    recorded as 8 g + 56 g came out 12 g heavy, with dry food lying on top of the
+    soaked meal. The feeder's served amounts always equal the plan on a successful
+    feed, so they don't reveal an over-dispense; the bowl weight does."""
+    after = feed.get("left_weight", 0)
+    ft = int(feed.get("feed_time", 0))
+    if after <= 0 or feed.get("status") != 1:
+        return None
+    before = bowl_now({
+        "feed_list": [f for f in ledger.get("feed_list", []) if f.get("feed_time", 0) < ft],
+        "eat_list": [e for e in ledger.get("eat_list", []) if (e.get("end_time") or 0) < ft],
+    })
+    if before is None:
+        return None
+    served = float(feed.get("feed_weight", 0)) + float(feed.get("water_weight", 0))
+    return after - served - before.grams, before.grams, before.last_feed_at
+
+
 @dataclass(frozen=True)
 class Plan:
     action: str        # "full" (serve the meal as scheduled), "topup", or "skip"

@@ -147,6 +147,7 @@ class Policy:
     # battery backup (power.py); power_guard.py takes over at its own critical voltage
     power_alert_after_s: float = 60.0       # on battery this long before "power is out"
     battery_low_v: float = 3.55             # "battery low" alert at or below this, on battery
+    overdispense_alert_g: float = 8.0       # alert when a meal leaves this much more in the bowl than it should
     killswitch: Path = field(default_factory=lambda: Path("riko_state/DISABLE_REMEDIATION"))
 
 
@@ -240,6 +241,7 @@ class Monitor:
         self._on_battery_since: float | None = None
         self._power_alerted = False  # "power is out" has gone out for this outage
         self._battery_low_alerted = False
+        self._scale_at_prep: float | None = None   # the scale's last report time, as of the latest prep
         self._warned_food = False
         self._warned_water = False
         self._bowl_back_count = 0    # consecutive polls with bowl detected, while suspended-for-bowl
@@ -301,6 +303,8 @@ class Monitor:
         self._write_status_snapshot(raw=st.raw)
         self._offline_since = None
         self._status_failures = 0
+        if st.state == FeederState.PREPARING:
+            self._scale_at_prep = st.reported_at("bowlStatus") or 0.0
 
         self._check_levels(st)
         await self._check_state(st)
@@ -878,6 +882,7 @@ class Monitor:
                 continue
             newest = max(newest, ft)
             if f.get("status") == 1:
+                self._check_overdispense(ledger, f)
                 continue  # succeeded
             new_failures += 1
             reason_str = decode_fail_reason(f.get("fail_reason", ""))
@@ -900,6 +905,32 @@ class Monitor:
 
         if newest > last_seen:
             self.store.put_setting("ledger_last_feed_time", str(newest))
+
+    def _check_overdispense(self, ledger: dict, feed: dict) -> None:
+        """Alert when a meal leaves more in the bowl than the leftover plus what the
+        feeder says it served (topup.unexplained_extra). Seen 2026-10-11: ~12 g of dry
+        food on top of a meal the feeder recorded as a normal 8 g + 56 g."""
+        res = topup.unexplained_extra(ledger, feed)
+        if res is None:
+            return
+        extra, before, prev_feed_at = res
+        when = time.strftime("%H:%M", time.localtime(feed["feed_time"]))
+        served = f"{feed.get('feed_weight', 0)} g food + {feed.get('water_weight', 0)} g water"
+        log.info("meal %s: bowl %d g after serving; %.0f g already there + %s -> %+.0f g unexplained",
+                 when, feed["left_weight"], before, served, extra)
+        if extra < self.p.overdispense_alert_g:
+            return
+        if self._scale_at_prep is None or self._scale_at_prep > prev_feed_at + topup.HANDLED_GRACE_S:
+            # the bowl was taken off or put back before this meal (or we weren't watching),
+            # so "already there" can't be trusted — see topup.handled_since_meal
+            log.info("meal %s: not alerting on the extra %.0f g; the bowl was handled before it", when, extra)
+            return
+        self.n.action_needed(
+            f"{when} meal: about {extra:.0f} g too much in the bowl",
+            f"The bowl reads {feed['left_weight']} g after serving. It should be about "
+            f"{feed['left_weight'] - extra:.0f} g: {before:.0f} g already there plus {served}, which is "
+            f"what the feeder recorded. When this happened before, the extra was dry food on top "
+            f"of the meal. Check the bowl.")
 
     async def _check_clock(self, st: RikoStatus) -> None:
         """Verify the device's clock against real wall-clock time, using the device's
