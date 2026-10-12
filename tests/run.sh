@@ -25,5 +25,8 @@ run "top-up"        $PY tests/test_topup.py
 run "over-dispense" $PY tests/test_overdispense.py $LEDGER
 run "clock"         $PY tests/test_clock.py
 run "power"         $PY tests/test_power.py $PROPS
+run "failover"      $PY tests/test_failover.py
+run "session"       $PY tests/test_session.py
+run "water ratio"   bash tests/test_ratio.sh
 [[ -n $LEDGER ]] && rm -f "$LEDGER"
 [[ $fail -eq 0 ]] && echo "all tests passed" || { echo "some tests FAILED"; exit 1; }

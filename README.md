@@ -177,7 +177,7 @@ applies from the next meal.
 | `monitor.py` + `notify.py` + `config.py` | A background monitor (systemd-friendly) that watches for missed feeds, pump stalls, clock drift, low food/water and **setting changes**, fixes the safe cases under hard caps, and pushes phone notifications via [ntfy](https://ntfy.sh). |
 | `neakasa.py` | Reads the intake ledger — per-meal actual-vs-planned grams, failure reasons, and eat sessions — from Neakasa's feeder backend. Self-sufficient: logs in with your account and needs the feeder owner's user_id (a number, not a secret). See "Intake history" below. |
 | `setup.sh` | Guided setup for the monitor — see below. Start here if you want more than the bowl-weight fix. |
-| `tests/` | Tests for the monitor's automatic behavior (top-up, over-dispense alert, clock upkeep, battery), run against a simulated feeder. `tests/run.sh` runs them all; nothing touches the real device. |
+| `tests/` | Tests for the automatic behavior (top-up, over-dispense alert, clock upkeep, battery, cellular failover, session handling, the water-ratio script), run against a simulated feeder. `tests/run.sh` runs them all; nothing touches the real device. |
 | `riko_discover.py`, `riko_tsl_probe.py`, `riko_trace.py`, `riko_poll.py`, `riko_pump_test.py` | Diagnostic scripts used to produce the findings. |
 
 `riko.py --help` and each script's header explain usage. Most read credentials from a
