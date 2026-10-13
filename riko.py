@@ -430,6 +430,11 @@ class Riko:
 
     async def invoke(self, identifier: str, **args: Any) -> Any:
         """Call a TSL service and return the gateway's response data (if any)."""
+        log.info("invoke %s %s", identifier, args)
+        return await self._invoke(identifier, args)
+
+    async def _invoke(self, identifier: str, args: dict[str, Any]) -> Any:
+        """invoke() without the log line, for reads that happen every few minutes."""
         dev = await self._resolve()
 
         async def call() -> Any:
@@ -440,7 +445,6 @@ class Riko:
                 language="en-US",
                 context=f"invoke {identifier}",
             )
-        log.info("invoke %s %s", identifier, args)
         return await self._with_relogin(call)
 
     # --- status ----------------------------------------------------------
@@ -642,9 +646,17 @@ class Riko:
         feeder for a fresh reading (to 0.01 g), and works mid-meal too. Food in the bowl
         is the first minus the second. A reading near zero means the bowl is off the tray.
         """
-        res = await self.invoke("iotRead", readType=2)
+        res = await self._invoke("iotRead", {"readType": 2})
         reading = res["data"]["Params"]["str"]
         return float(reading["gram"]), int(reading["bowlGram"])
+
+    async def device_time(self) -> float:
+        """The feeder's own clock, as unix seconds (it reports local wall time, which is
+        read in this machine's timezone - they must be set to the same one). There is no
+        property for this; it is a diagnostic read, good to about a second."""
+        res = await self._invoke("iotRead", {"readType": 0})
+        stamp = res["data"]["Params"]["str"]["time"]
+        return time.mktime(time.strptime(stamp, "%Y-%m-%d %H:%M:%S"))
 
     async def sync_time(self, source: int = 1) -> Any:
         """Ask the device to re-sync its clock. 0 = from Neakasa backend, 1 = from Aliyun."""

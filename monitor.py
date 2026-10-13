@@ -136,7 +136,9 @@ class Policy:
     max_bowl_tare_fixes_per_day: int = 10  # beyond this, stop auto-fixing and escalate
     missed_feed_grace_min: float = 6.0      # minutes past the expected serve before "missed"
     offline_after_min: float = 15.0         # no device report for this long -> offline
-    clock_hold_after_slot_min: float = 60.0 # no clock sync this long after a slot that hasn't been seen to run
+    clock_check_every_s: float = 120.0      # how often to compare the feeder's clock with ours
+    clock_tolerance_s: float = 10.0         # closer than this counts as in step
+    clock_late_ok_s: float = 240.0          # a clock jump may land this far past a slot and still serve it
     # top-up (see topup.py): "on" rewrites the next meal, "observe" only logs what it
     # would do, "off" does nothing
     topup_mode: str = "observe"
@@ -242,10 +244,10 @@ class Monitor:
         self._power_alerted = False  # "power is out" has gone out for this outage
         self._battery_low_alerted = False
         self._scale_at_prep: float | None = None   # the scale's last report time, as of the latest prep
-        self._clock_prev_state: FeederState | None = None
-        self._clock_synced_since_start = False
-        self._feeder_on_battery_since: float | None = None
-        self._meal_seen_at = float(store.get_setting("clock_meal_seen_at") or 0) if store else 0.0
+        self._clock_next_check = 0.0
+        self._clock_syncs = 0              # syncs sent since the clock was last seen in step
+        self._clock_stuck_alerted = False
+        self._clock_held_for: str | None = None
         self._jam: dict | None = None      # the grinder fault in progress, if any
         self._warned_food = False
         self._warned_water = False
@@ -1044,98 +1046,112 @@ class Monitor:
 
 
     # ---- keeping the feeder's clock right ------------------------------------------
-    def _today_slots(self, plan: dict | None) -> list[tuple[int, int]]:
-        """[(slot_sec, seconds since that slot today; negative = still to come)] for
-        slots that are on and not skipped for today."""
+    def _today_slots(self, plan: dict | None) -> list[int]:
+        """Seconds-from-midnight of the meals that are on and not skipped for today."""
         if not plan:
             return []
-        lt = time.localtime()
-        now_sec = lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec
         times = plan.get("time", [])
         en = plan.get("bEn") or [1] * len(times)
         day_en = plan.get("bDayEn") or [1] * len(times)
-        return [(sec, (now_sec - sec + 43200) % 86400 - 43200)
-                for sec, e, d in zip(times, en, day_en) if e and d]
+        return [sec for sec, e, d in zip(times, en, day_en) if e and d]
+
+    def _sync_would_cost_a_meal(self, device_tod: float, drift: float, lead: float,
+                                slots: list[int]) -> str | None:
+        """Would correcting the clock right now skip or repeat a meal? Returns that
+        meal's HH:MM if so.
+
+        A sync moves the feeder's clock by `drift` seconds in one jump. The feeder
+        starts a meal at (slot - lead) by its own clock. If its clock jumps from before
+        that moment to more than a few minutes past the slot, it marks the meal Expired
+        instead of serving it (2026-10-12: a 22.7-minute jump that landed 6 minutes
+        after the 03:55 slot; on 2026-09-28 a jump that landed 5 minutes after did
+        serve). A backward jump from after a meal's start to before its expiry could
+        serve it twice.
+        """
+        landing = device_tod + drift
+        for slot in slots:
+            for day in (-86400, 0, 86400):
+                start, expires = slot + day - lead, slot + day + self.p.clock_late_ok_s
+                skips = drift > 0 and device_tod < start and landing > expires
+                repeats = drift < 0 and device_tod >= start and landing < expires
+                if skips or repeats:
+                    return time.strftime("%H:%M", time.gmtime(slot))
+        return None
 
     async def _keep_clock(self, st: RikoStatus) -> None:
-        """Keep the feeder's clock right before a meal is due, instead of repairing it
-        after one is missed.
+        """Read the feeder's own clock and correct it as soon as it is wrong.
 
         The feeder's clock falls 20-30 minutes behind after even a short power
-        interruption (5 min on 2026-09-27 -> 28.2 min slow; 3 min on 2026-10-11 ->
-        22.7 min slow) and never corrects itself; every meal then runs that late.
-        Syncing is harmless when the clock is right, so sync:
-          * when the feeder is back on wall power after being on battery;
-          * after every meal (so the clock is never more than one meal stale);
-          * once after the monitor starts;
-          * when a meal is due in under its soak time and the feeder still hasn't
-            started preparing - the one sign of a slow clock we can see in advance.
-        Never sync in the hour after a slot that hasn't been seen to run: the feeder
-        may be about to serve it late on its slow clock, and a jump past the slot makes
-        it mark the meal Expired (2026-10-12, 03:55).
+        interruption (5 min unplugged on 2026-09-27 -> 28.2 min slow; 3 min on
+        2026-10-11 -> 22.7 min slow) and never corrects itself; every meal then runs
+        that late. The feeder reports its clock on request (Riko.device_time), so
+        every couple of minutes compare it with ours and sync when they differ.
+
+        The one time not to sync is when the jump itself would cost a meal (see
+        _sync_would_cost_a_meal). Then the feeder is left to run that meal on its own
+        clock, and the sync happens right after.
         """
         now = time.time()
-        state = st.state
-        plan = self._schedule_plan(st)
-        if state in (FeederState.PREPARING, FeederState.SERVING):
-            if now - self._meal_seen_at > 60:
-                self.store.put_setting("clock_meal_seen_at", str(int(now)))
-            self._meal_seen_at = now
-        pwr = (st._p("pwrStatus", {}) or {}).get("pwrType")
-        if pwr == 1:
-            self._feeder_on_battery_since = self._feeder_on_battery_since or now
-        prev, self._clock_prev_state = self._clock_prev_state, state
-
-        lead = max(0, st.default_feed.soak_min) * 60      # prep starts this long before the slot
-        late_slot = None
-        if lead >= 180:
-            for slot_sec, since in self._today_slots(plan):
-                if -(lead - 40) <= since <= -120:          # due soon, and prep should be under way
-                    late_slot = time.strftime("%H:%M", time.gmtime(slot_sec))
-        if late_slot and self.store.get_setting("clock_presync") == f"{_today()} {late_slot}":
-            late_slot = None                               # already tried for this meal
-
-        if state != FeederState.IDLE:
-            return                                         # mid-meal, asleep on battery, suspended
-        if late_slot:
-            reason = "late"
-        elif pwr == 0 and self._feeder_on_battery_since:
-            reason = "power"
-        elif prev in (FeederState.PREPARING, FeederState.SERVING):
-            reason = "meal"
-        elif not self._clock_synced_since_start:
-            reason = "start"
-        else:
+        if now < self._clock_next_check or st.state != FeederState.IDLE:
+            return                              # never mid-meal; asleep on battery it can't answer
+        self._clock_next_check = now + self.p.clock_check_every_s
+        try:
+            device = await self.r.device_time()
+        except Exception as exc:
+            log.info("clock: couldn't read the feeder's clock: %r", exc)
             return
-        if reason != "late":
-            hold = self.p.clock_hold_after_slot_min * 60
-            for slot_sec, since in self._today_slots(plan):
-                if 300 < since < hold and self._meal_seen_at < now - since - lead - 120:
-                    log.info("clock: holding the sync; the %s meal hasn't been seen to run and may "
-                             "still be served late", time.strftime("%H:%M", time.gmtime(slot_sec)))
-                    return
+        drift = now - device                    # + = the feeder is slow
+        if abs(drift) < self.p.clock_tolerance_s:
+            if self._clock_syncs:
+                log.info("clock: the feeder is back in step")
+            self._clock_syncs, self._clock_stuck_alerted, self._clock_held_for = 0, False, None
+            return
+        mins = abs(drift) / 60
+        how = f"{mins:.1f} min {'slow' if drift > 0 else 'fast'}"
+        if abs(drift) > 2 * 3600:
+            # hours out is a timezone or DST setting, which _check_clock owns - not drift
+            if self.store.get_setting("clock_tz_alerted") != _today():
+                self.store.put_setting("clock_tz_alerted", _today())
+                self.n.action_needed(
+                    "Feeder clock is hours off",
+                    f"The feeder's clock is {mins / 60:.1f} hours {'behind' if drift > 0 else 'ahead'}. That "
+                    f"looks like a timezone setting, not drift, so it was left alone. Check it in the app.")
+            return
+        lt = time.localtime(device)
+        device_tod = lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec
+        lead = max(0, st.default_feed.soak_min) * 60
+        meal = self._sync_would_cost_a_meal(device_tod, drift, lead,
+                                            self._today_slots(self._schedule_plan(st)))
+        if meal:
+            if self._clock_held_for != meal:
+                self._clock_held_for = meal
+                self.n.fyi(
+                    f"Feeder clock is {how} — fixing it after the {meal} meal",
+                    f"Correcting it right now would make the feeder skip or repeat the {meal} meal. "
+                    f"So that meal will run about {mins:.0f} min {'late' if drift > 0 else 'early'}, "
+                    f"and the clock will be synced straight after.")
+            return
         allowed, why = self._remediation_allowed(0.0, 0.0)
         if not allowed:
-            log.info("clock: would sync (%s) but %s", reason, why)
-            self._clock_synced_since_start = True
+            log.info("clock: the feeder is %s; would sync but %s", how, why)
             return
-        if reason == "late":
-            self.store.put_setting("clock_presync", f"{_today()} {late_slot}")
+        if self._clock_syncs >= 2:              # two syncs didn't take: say so, then try every 30 min
+            if not self._clock_stuck_alerted:
+                self._clock_stuck_alerted = True
+                self.n.action_needed(
+                    "Feeder clock won't sync",
+                    f"The feeder's clock is {how} and two syncs haven't fixed it. Meals will run that "
+                    f"far off schedule. Trying again every 30 minutes.")
+            self._clock_next_check = now + 1800
+            await self.r.sync_time()
+            return
+        self._clock_syncs += 1
         await self.r.sync_time()
-        self._clock_synced_since_start = True
-        if reason == "late":
-            self.n.fyi(f"Feeder clock was behind — synced before the {late_slot} meal",
-                       f"The feeder hadn't started preparing the {late_slot} meal when it should "
-                       f"have, which is what a slow clock looks like. Its clock has been synced; it "
-                       f"should start preparing now and serve at about {late_slot}.")
-        elif reason == "power":
-            mins = (now - self._feeder_on_battery_since) / 60
-            self._feeder_on_battery_since = None
-            self.n.fyi("Feeder lost power — clock re-synced",
-                       f"The feeder was on battery for about {mins:.0f} min. Its clock falls 20-30 "
-                       f"minutes behind after a power interruption, so it has been re-synced.")
-        else:
-            log.info("clock: synced (%s)", "after a meal" if reason == "meal" else "monitor start")
+        self._clock_next_check = now + 30       # confirm it took
+        if self._clock_syncs == 1:
+            self.n.fyi(f"Feeder clock was {how} — synced",
+                       f"The feeder's clock was {how}. It falls behind after a power interruption. "
+                       f"It has been synced, so meals stay on schedule.")
 
     async def _check_schedule_drift(self, st: RikoStatus) -> None:
         """Catch clock drift that _check_clock CAN'T see.
@@ -1220,8 +1236,8 @@ class Monitor:
         # Alert only. This used to sync the clock here, which is what skipped the
         # 03:55 meal on 2026-10-12: the feeder was 22.7 minutes slow and would have
         # served late on its own, but a sync 6 minutes after the slot jumped its clock
-        # past the meal and it marked it "Expired". _keep_clock now keeps the clock
-        # right BEFORE a meal is due.
+        # past the meal and it marked it "Expired". _keep_clock now reads the feeder's
+        # clock directly and corrects it as soon as it is wrong.
         notified_key = f"meal_overdue_notified_{today}"
         if self.store.get_setting(notified_key) == slot_label:
             return
