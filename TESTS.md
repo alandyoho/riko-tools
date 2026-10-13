@@ -330,8 +330,9 @@ schedule, or a power blip. Not a Riko problem but worth finding.
   forwarded-packet count stayed at 0 for the whole relay and the only cellular
   traffic (~15 KB) was the Pi's own: the feeder kept sending to the router. No send
   errors were logged; whether the router dropped the redirect or the feeder ignored
-  it is unknown. The relay is now off by default (`RIKO_FAILOVER_RELAY=1` enables
-  it); the hotspot takeover is unaffected. Alternative not pursued for now: have
+  it is unknown. The relay was switched off by default, then removed from
+  `wifi_failover.py` on 2026-10-12 (it is in the git history at 0fc8baa); the hotspot
+  takeover is unaffected. Alternative not pursued for now: have
   Pi-hole hand the feeder the Pi as gateway/DNS, which makes the feeder depend on
   the Pi all the time.
 - **2026-10-07 — How much of a meal is left when the next one is due?** It's

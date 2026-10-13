@@ -5,7 +5,6 @@ Every network command is faked; nothing touches nmcli, hostapd, nftables or the 
 import os, subprocess, sys, tempfile, types, json
 from pathlib import Path
 os.environ["RIKO_FEEDER_MAC"] = "98:3d:ae:7a:56:cc"
-os.environ["RIKO_FAILOVER_RELAY"] = "1"          # the relay is off by default; test it switched on
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import wifi_failover as W
 
@@ -15,45 +14,27 @@ sample = ("BSS 82:f8:53:cb:74:4c(on wlan0) -- associated\n\tTSF: 1\n\tSSID: LFYT
 assert W.parse_iw_scan(sample) == [("82:f8:53:cb:74:4c", "LFYTT-iot"), ("aa:bb:cc:dd:ee:ff", "Other Net")]
 print("1 ok: scan parsing")
 
-# 2. firewall rules: only the feeder is forwarded; the relay adds the DNS redirect
+# 2. firewall rules: only the feeder is forwarded
 W.pwd = types.SimpleNamespace(getpwnam=lambda user: types.SimpleNamespace(pw_uid=1000))
 rs = W.nft_ruleset()
-assert "ether saddr != 98:3d:ae:7a:56:cc drop" in rs and "skuid 1000" in rs and "masquerade" in rs and "dnat" not in rs, rs
-assert "dnat ip to 8.8.8.8" in W.nft_ruleset(relay=True)
-print("2 ok: nft ruleset (hotspot and relay)")
-
-# 3. the ARP frame used by the relay
-f = W.arp_reply("aa:aa:aa:aa:aa:aa", "192.168.1.1", "aa:aa:aa:aa:aa:aa", "98:3d:ae:7a:56:cc", "192.168.1.77")
-assert len(f) == 42 and f[:6].hex() == "983dae7a56cc" and f[12:14] == b"\x08\x06" and f[20:22] == b"\x00\x02"
-assert f[22:28].hex() == "aa" * 6 and f[28:32] == bytes([192, 168, 1, 1]) and f[38:42] == bytes([192, 168, 1, 77])
-print("3 ok: ARP reply frame is well-formed")
+assert "ether saddr != 98:3d:ae:7a:56:cc drop" in rs and "skuid 1000" in rs and "masquerade" in rs, rs
+print("2 ok: nft ruleset")
 
 # ---- the state machine, with the outside world faked -------------------------
 calls = []
-world = {"wlan": W.HOME_CON, "visible": True, "ap_scan": False, "bytes": 0, "now": 1000.0, "internet": True}
+world = {"wlan": W.HOME_CON, "visible": True, "ap_scan": False, "bytes": 0, "now": 1000.0}
 ap = {"ok": True}
 def fake_run(*cmd, timeout=60, stdin=None):
     calls.append(" ".join(cmd)); return subprocess.CompletedProcess(cmd, 0, "", "")
 def fake_ap_up(): calls.append("AP UP"); return ap["ok"]
 def fake_ap_down(): calls.append("AP DOWN")
-arps = []
-class FakeArp:
-    def __init__(self, feeder_ip, real): self.feeder_ip, self.real = feeder_ip, real; arps.append(self)
-    def start(self): calls.append("ARP START")
-    def stop(self): calls.append("ARP STOP")
 W.run, W.ap_up, W.ap_down, W.rejoin_home = fake_run, fake_ap_up, fake_ap_down, lambda wait_s=90: True
 W.home_ssid = lambda: "LFYTT-iot"
 W.wlan_connection = lambda: world["wlan"]
 W.ssid_visible_as_client = lambda s: world["visible"]
 W.ssid_visible_as_ap = lambda s: world["ap_scan"]
 W.wwan_bytes = lambda: world["bytes"]
-W.internet_via_router = lambda: world["internet"]
-W.lan_info = lambda: {"gateway": "192.168.1.1", "dns": "192.168.1.151", "subnet": "192.168.1."}
-W.neighbors = lambda: {"192.168.1.1": "b8:f8:53:cb:74:49", "192.168.1.151": "2c:cf:67:92:e8:65",
-                       "192.168.1.77": "98:3d:ae:7a:56:cc"}
-W.prefer_cellular_route = lambda: (calls.append("ROUTE VIA CELL") or True)
-W.nft_apply = lambda relay=False: (calls.append(f"NFT relay={relay}") or True)
-W.ArpRedirect = FakeArp
+W.nft_apply = lambda: (calls.append("NFT") or True)
 W.time = types.SimpleNamespace(time=lambda: world["now"], sleep=lambda s: None)
 notes = []
 n = types.SimpleNamespace(action_needed=lambda t, b: notes.append(("ACT", t)), fyi=lambda t, b: notes.append(("FYI", t)))
@@ -67,7 +48,7 @@ world.update(wlan=None, visible=True); tick(); assert fo.down_since is None     
 world.update(visible=False)
 for _ in range(6): tick()
 assert not fo.active, "should wait the full window"
-tick(); assert fo.mode == "hotspot" and (d / "FAILOVER").exists()
+tick(); assert fo.active and (d / "FAILOVER").exists()
 up = [c for c in calls if "connection up" in c or c == "AP UP"]
 assert up[0].endswith("cellular-1nce") and up[1] == "AP UP", up
 assert any("systemctl stop riko-watch" in c for c in calls) and notes[-1][0] == "ACT"
@@ -117,46 +98,8 @@ for _ in range(8): tick()
 assert not fo.active and not (d / "FAILOVER").exists() and "nmcli connection down cellular-1nce" in calls
 print("8 ok: failed hotspot start backs out cleanly")
 
-# 9. relay: router up, internet down
-ap["ok"] = True; world.update(wlan=W.HOME_CON, visible=True, internet=True, bytes=0); calls.clear()
-tick(); assert not fo.active
-world["internet"] = False
-for _ in range(8): tick()
-assert not fo.active, "should wait the full window"
-tick(); assert fo.mode == "relay", fo.mode
-order = [c for c in calls if c in ("NFT relay=True", "ROUTE VIA CELL", "ARP START") or c.endswith("up cellular-1nce")]
-assert [o.split()[-1] for o in order] == ["cellular-1nce", "relay=True", "CELL", "START"], order
-assert arps[-1].feeder_ip == "192.168.1.77" and set(arps[-1].real) == {"192.168.1.1", "192.168.1.151"}
-assert "AP UP" not in calls and "Internet down" in notes[-1][1]
-world["internet"] = True
-for _ in range(9): tick()
-assert not fo.active and "ARP STOP" in calls and notes[-1] == ("FYI", "Internet back — cellular backup off")
-print("9 ok: relay entered and left;", notes[-1][1])
-
-# 10. the test switch drives the relay; the router dying mid-relay falls through to the hotspot
-calls.clear(); (d / "SIMULATE_INTERNET_DOWN").touch()
-for _ in range(10): tick()
-assert fo.mode == "relay"
-(d / "SIMULATE_INTERNET_DOWN").unlink()
-for _ in range(9): tick()
-assert not fo.active
-world["internet"] = False
-for _ in range(10): tick()
-assert fo.mode == "relay"
-world.update(wlan=None, visible=False); tick(); assert not fo.active
-for _ in range(8): tick()
-assert fo.mode == "hotspot"
-print("10 ok: test switch works; router dying mid-relay becomes a hotspot takeover")
-
-# 11. relay switched off (the default): an internet outage does nothing, the hotspot still works
-W.RELAY_ENABLED = False
-world.update(wlan=W.HOME_CON, visible=True, internet=True, bytes=0)
-(d / "DISABLE_FAILOVER").touch(); tick(); (d / "DISABLE_FAILOVER").unlink()
-assert not fo.active
-world["internet"] = False; calls.clear()
+# 9. while connected to the home Wi-Fi nothing happens, whatever the internet is doing
+ap["ok"] = True; world.update(wlan=W.HOME_CON, visible=True, bytes=0); calls.clear()
 for _ in range(20): tick()
 assert not fo.active and not calls, calls
-world.update(wlan=None, visible=False)
-for _ in range(8): tick()
-assert fo.mode == "hotspot"
-print("11 ok: with the relay off, an internet outage does nothing; the hotspot takeover still works")
+print("9 ok: connected to the home Wi-Fi -> no action")
