@@ -3,6 +3,10 @@
 Everything below was determined by talking to the feeder through its cloud API and
 checking the results against a kitchen scale. Firmware 1.0.0-0020.
 
+Most of this was written on 2026-09-07. Firmware has since moved to 1.0.0-0033 and
+several findings changed. Those are marked **Update** with a date where they sit, and
+the newer findings are in "Found later" below. TESTS.md has the evidence for each.
+
 ---
 
 ## Current state (2026-09-07)
@@ -27,6 +31,15 @@ Everything below was learned over two days of investigation. Where it stands now
 
 Open items live in TESTS.md; cleanup chores at the bottom of it.
 
+**Update 2026-10-12 — what has changed since this snapshot:**
+
+- The monitor is live, not dry-run, and does more: it tops up or skips a meal when the
+  last one wasn't eaten, alerts on food the feeder didn't count, keeps the feeder's
+  clock right, and handles grinder jams and the Pi's battery backup. See the README.
+- The intake ledger is self-sufficient: `neakasa.py` reads it with a normal login.
+- The daylight-saving bug was fixed by Neakasa in firmware 1.0.0-0023.
+- The feeder reports a live scale reading and its own clock on request (`iotRead`).
+
 
 ## Bugs, with workarounds
 
@@ -46,6 +59,10 @@ There is no time or timezone setting in the app. Writing `timeZoneMsg` with
 `zone: -4, dst: 0` corrects it immediately and survives a reboot. Revert to
 `zone: -5` when DST ends (Nov 1).
 
+**Update:** fixed in firmware 1.0.0-0023. The honest setting (`zone: -5, dst: 1`) is
+now the right one, and the feeder applies the hour itself. A different clock fault
+remains — see "The clock falls behind after a power interruption" below.
+
 ### The stored empty-bowl weight is wrong
 Food-in-bowl is computed as scale reading minus a stored empty-bowl weight. The
 stored value is **65 g**. The bowls that ship with the unit weigh **67.9–68.7 g**
@@ -59,6 +76,9 @@ The app's tare button doesn't fix it — it zeroes the platform and leaves the 6
 alone. The underlying command (`resetScaleZero`) accepts a bowl-weight argument;
 the app just never sends one. Sending 68 fixes it permanently: an empty bowl now
 reads 0.
+
+**Update:** on earlier firmware the app reset the corrected value to 65 after updates.
+It has held at 68 since 1.0.0-0033.
 
 ### "Nozzle clogged" is a pump that lost its prime
 The device's own error is `pumper: Stuck` (code 70). Water drains back toward the
@@ -89,6 +109,39 @@ It doesn't fail cleanly. The feeder goes to "preparing" with the tray extended a
 sits there indefinitely, flashing on the display. Reseating the bowl does not
 release it; the feed has to be cancelled.
 
+### The clock falls behind after a power interruption
+*(Found 2026-10-12, firmware 1.0.0-0033.)* Unplugging the feeder for a few minutes
+leaves its clock 20–30 minutes slow, and it never corrects itself:
+
+- 2026-09-27: on battery 20:32–20:37 (5 min). The next four meals each started
+  28.2 minutes late.
+- 2026-10-11: on battery 20:17–20:20 (3 min). The 23:55 meal started preparing at
+  00:07:43, and the feeder's midnight rollover arrived at 00:22:43 — 22.7 minutes slow.
+
+The lost time is not the length of the outage. Every meal after that runs late by the
+same amount until the clock is synced (`updateTime`), with nothing shown in the app.
+
+Syncing is not free of risk either: if the clock jumps from before a meal's start to
+more than about five minutes past its slot, the feeder marks that meal "Expired" and
+does not serve it. A jump that landed 5 minutes after a slot did serve (2026-09-28);
+one that landed 6 minutes after did not (2026-10-12).
+
+### Food the feeder doesn't count
+*(Found 2026-10-11 and 2026-10-12, firmware 1.0.0-0033.)* The feeder grinds until its
+scale sees the target weight (see "The feeder doses by weight" below), and its record
+of a successful meal always equals the plan. Food that hangs up between the grinder
+and the bowl is ground without being counted, and lands later, dry:
+
+- **Dry food on top of a soaked meal.** A meal recorded as a normal 8 g + 56 g left
+  76 g in the bowl, with dry food lying on top; 12 g had to be removed. Three meals
+  out of about a hundred came out 9–12 g over what the record explains.
+- **A dump after a jam.** With the grinder reporting "jammed with food" (code 13), the
+  food that had built up came out at once: the meal was recorded as 0 g food + 27 g
+  water and left 83 g in the bowl, about 56 g uncounted. A resume from the app did not
+  clear the jam.
+
+Take the bowl off before resuming or clearing a jam.
+
 ### The device leaks its own credentials
 The device-info endpoint the app uses returns the feeder's cloud authentication
 secret — to a *shared* account, not just the owner. That's a security problem
@@ -99,6 +152,13 @@ rather than a bug.
 ## How the machine actually behaves
 
 ### The bowl weight is not live
+**Update 2026-10-12:** this section describes the `bowlStatus` property, and it is still
+true of that property — on 1.0.0-0033 it only updates when the bowl is taken off or
+put back. But the conclusions below no longer hold, because there are two other
+sources: the feeder returns a **live scale reading on request** (`iotRead` type 2, to
+0.01 g, and it works mid-meal), and the intake ledger logs eating in 10-minute windows
+with "ate X, left Y". So software can tell when the bowl is empty.
+
 The reported weight is a cached value. Polling it every second through a
 197-second dispense showed no change at all. It refreshes only when:
 - the bowl physically leaves or returns to the tray, and
@@ -149,6 +209,10 @@ Actual cycles run well under the estimate: 110–197 seconds for an 8 g/24 g mea
 The estimate is a conservative budget, not a measurement.
 
 ### Manual feeds skip the soak
+**Update 2026-10-12:** no longer true. On firmware 1.0.0-0033 a manual feed soaks like a
+scheduled one: a traced 4 g + 28 g manual meal finished dispensing at 140 s and was
+served at 743 s, exactly 10 minutes later. The text below describes 1.0.0-0020.
+
 "Feed now" grinds, adds water, and serves immediately — about two minutes — from
 both the app and the API. The rehydration time only applies to scheduled meals.
 The app still quotes the full soak in its estimate, so it says 11 minutes for
@@ -160,6 +224,23 @@ Requested 12, 24, and 36 g in separate water-only feeds; delivered 11.9, 24.1, a
 fifth of a gram, with no fixed per-feed cost. Food accuracy hasn't been measured
 separately yet, but a full 8 g/24 g meal came in at 34.25 g against a 32 g target,
 so the ~2 g of slack is on the food side.
+
+**Update 2026-10-12:** a live scale trace supports that. A 4 g + 28 g meal ended at
+34.0 g; the four water doses totalled 28.2 g, and the extra arrived as a slow creep
+after the main food drop and between water doses (about 3 g in all). The first stretch
+of creep came before any water, so that part is food. A food-only trace would confirm
+the rest.
+
+### The feeder doses by weight
+*(Found 2026-10-12.)* There is one scale, under the bowl, and the bowl sits on it under
+the outlet for the whole preparation. A live trace of a meal shows the food landing
+first, then the water in equal measured doses a few seconds long, about 25 seconds
+apart (7.02, 7.04, 7.08 and 7.02 g for a 28 g order). Its error list includes "cat
+interference" during food dispensing (code 15) and water dispensing (code 72), and a
+meal cut short gets water in proportion to the food that actually arrived.
+
+The other sensors it exposes: an infrared sensor on the food bin, a water-level
+sensor, the grinder motor's voltage, the pump, a temperature sensor.
 
 ### The bowl does not retract between meals
 After serving, the tray stays out until the next meal. The only thing that pulls it
@@ -180,6 +261,10 @@ channel, run the pump directly, read raw sensor voltages, fake an error report. 
 those, only the voltage read demonstrably works. Config reads time out, the UDP
 toggle opens nothing, and direct pump control has never moved water in any state
 we could reach.
+
+**Update 2026-10-12:** one more works, and it is the useful one. `iotRead` returns, on
+request: the feeder's local time (type 0), a live scale reading (type 2), the food-bin
+sensor value (type 4) and the power state (type 3).
 
 ---
 
@@ -256,8 +341,19 @@ the bowl mechanism works. Every problem here is software:
 - fail cleanly when the bowl is missing instead of hanging
 - don't hand out device credentials to shared accounts
 
+Added 2026-10-12, from the later findings:
+
+- re-sync the clock when power returns or the feeder reconnects, and periodically
+- count food by what reaches the bowl after the grinder stops, and stop grinding when
+  nothing is arriving instead of building up a plug behind a jam
+- let the app set more than 1:5 food to water, and more than 10 minutes of soak
+- allow more than one login per account
+
 **On the tooling side:** device control is fully self-sufficient through the Aliyun
 channel. The app's own backend (intake ledger, cat profile) is readable only with a
 manually captured token, because the auth is gated by an AES key compiled into the
 Flutter binary that static analysis could not recover. Making that self-sufficient
 is a separate effort — see the key-extraction plan.
+
+**Update:** that effort succeeded. `neakasa.py` now logs in with the account's own
+credentials and reads the ledger with no captured token.
