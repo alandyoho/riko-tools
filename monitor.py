@@ -246,6 +246,7 @@ class Monitor:
         self._clock_synced_since_start = False
         self._feeder_on_battery_since: float | None = None
         self._meal_seen_at = float(store.get_setting("clock_meal_seen_at") or 0) if store else 0.0
+        self._jam: dict | None = None      # the grinder fault in progress, if any
         self._warned_food = False
         self._warned_water = False
         self._bowl_back_count = 0    # consecutive polls with bowl detected, while suspended-for-bowl
@@ -598,11 +599,63 @@ class Monitor:
             self.store.log_feed(cur.name, st.state_param)
             self._last_state = cur
 
+        if st.state != FeederState.SUSPENDED or st.state_param not in NEVER_RETRY:
+            self._jam = None               # that grinder fault is over
         if st.state == FeederState.SUSPENDED:
             await self._handle_suspension(st)
         elif st.state == FeederState.FAULT:
             self.n.action_needed("Feeder fault",
                                  f"Device in FAULT (param {st.state_param}). Needs a look.")
+
+    async def _handle_grinder_fault(self, code: int, name: str) -> None:
+        """Alert once per grinder fault (then every 10 minutes), never retry it, and for
+        a jam watch the bowl with the live scale.
+
+        The feeder grinds until its scale sees the target weight. When food backs up
+        behind a jam the scale sees nothing, the grinder keeps going, and everything
+        that built up can drop into the bowl at once - uncounted and dry. On
+        2026-10-12 a jammed meal recorded as 0 g of food left about 56 g extra in the
+        bowl, most likely when the meal was resumed. So: tell the owner to take the
+        bowl off first, and say so if the bowl's weight jumps while it is stuck.
+        """
+        food = None
+        try:
+            gram, bowl = await self.r.live_scale()
+            if gram > bowl / 2:                    # otherwise the bowl is off the tray
+                food = gram - bowl
+        except Exception as exc:
+            log.warning("grinder fault: couldn't read the scale: %r", exc)
+        now = time.time()
+        if self._jam is None or self._jam["code"] != code:
+            self._jam = {"code": code, "alerted_at": now, "base": food, "dumped": False}
+            if code == 13:
+                in_bowl = (f" The bowl holds about {max(0, food):.0f} g right now." if food is not None
+                           else " The bowl is off the tray right now.")
+                self.n.action_needed(
+                    f"Feeder stuck: {name}",
+                    "The meal is on hold and won't be retried automatically. Take the bowl off "
+                    "BEFORE you resume or clear it: food that has built up behind a jam can drop "
+                    f"all at once, dry and uncounted (about 56 g did on Oct 12).{in_bowl}")
+            else:
+                self.n.action_needed(f"Feeder stuck: {name}",
+                                     "Mechanical fault — not auto-retrying. Please check the grinder.")
+            return
+        jam = self._jam
+        if food is not None and jam["base"] is None:
+            jam["base"] = food                     # the bowl is back on; measure from here
+        if (food is not None and jam["base"] is not None and not jam["dumped"]
+                and food - jam["base"] >= self.p.overdispense_alert_g):
+            jam["dumped"] = True
+            self.n.action_needed(
+                f"About {food - jam['base']:.0f} g just dropped into the bowl",
+                f"While the feeder was stuck ({name}) the bowl went from about {max(0, jam['base']):.0f} g "
+                f"to {food:.0f} g. That is food from behind the jam, dry and not counted in the "
+                f"meal record. Take the bowl off and remove it.")
+        if now - jam["alerted_at"] >= 600:
+            jam["alerted_at"] = now
+            self.n.action_needed(f"Feeder still stuck: {name}",
+                                 "It has been stuck for over 10 minutes. Take the bowl off before you "
+                                 "resume or clear it.")
 
     async def _handle_bowl_missing_suspension(self, st: RikoStatus, name: str, slot: str) -> None:
         """Auto-resume a feed that's only paused because the bowl was missing.
@@ -660,8 +713,7 @@ class Monitor:
         slot = _current_slot_label(st, self.tz_offset)
 
         if code in NEVER_RETRY:
-            self.n.action_needed(f"Feeder stuck: {name}",
-                                 "Mechanical fault — not auto-retrying. Please check the grinder.")
+            await self._handle_grinder_fault(code, name)
             return
         if code == BOWL_MISSING:
             await self._handle_bowl_missing_suspension(st, name, slot)
@@ -889,8 +941,8 @@ class Monitor:
             if ft <= last_seen:
                 continue
             newest = max(newest, ft)
+            self._check_overdispense(ledger, f)   # failed meals too: a jam can dump uncounted food
             if f.get("status") == 1:
-                self._check_overdispense(ledger, f)
                 continue  # succeeded
             new_failures += 1
             reason_str = decode_fail_reason(f.get("fail_reason", ""))

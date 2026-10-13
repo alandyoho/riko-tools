@@ -45,4 +45,16 @@ async def main():
     assert not await run(76, prev + 3600);  print("2c ok: bowl handled before the meal -> no alert")
     assert not await run(76, None);         print("2d ok: monitor wasn't watching the prep -> no alert")
     assert not await run(0, prev - 3600);   print("2e ok: no bowl reading on the record -> no alert")
+    # a failed (jammed) meal that leaves far more in the bowl than it recorded - 2026-10-12
+    notes = []
+    n = types.SimpleNamespace(action_needed=lambda t, b: notes.append((t, b)) or True, fyi=lambda t, b: True)
+    led = ledger(83); led["feed_list"][1].update(status=2, feed_weight=0, water_weight=27, fail_reason='{"reason":1,"resParam":1}')
+    class F:
+        async def ledger(self, *a, **k): return led
+    mon = M.Monitor(None, M.Store(Path(tempfile.mkdtemp()) / "m.db"), n, M.Policy(killswitch=Path("/nonexistent")), 0, False, neakasa=F(), device_name="dev")
+    mon.store.put_setting("ledger_last_feed_time", str(prev)); mon._scale_at_prep = prev - 3600
+    await mon.check_ledger_failures(None)
+    titles = [t for t, _ in notes]
+    assert any(t.endswith("about 56 g too much in the bowl") for t in titles) and any(t.startswith("Feed failed") for t in titles), titles
+    print("2f ok: failed meal ->", titles)
 asyncio.run(main())

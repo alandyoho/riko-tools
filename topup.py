@@ -101,11 +101,15 @@ def unexplained_extra(ledger: dict[str, Any], feed: dict[str, Any]) -> tuple[flo
     worked out. Over 100 meals the extra is normally 0-3 g; on 2026-10-11 a meal
     recorded as 8 g + 56 g came out 12 g heavy, with dry food lying on top of the
     soaked meal. The feeder's served amounts always equal the plan on a successful
-    feed, so they don't reveal an over-dispense; the bowl weight does."""
+    feed, so they don't reveal an over-dispense; the bowl weight does.
+
+    Failed feeds count too: on 2026-10-12 a jammed meal was recorded as 0 g food +
+    27 g water and left 83 g in the bowl - food had backed up behind the jam, uncounted
+    (the feeder grinds until its scale sees the target), and then dropped all at once."""
     after = feed.get("left_weight", 0)
     ft = int(feed.get("feed_time", 0))
-    if after <= 0 or feed.get("status") != 1:
-        return None
+    if after <= 0:
+        return None            # no bowl reading on this record
     before = bowl_now({
         "feed_list": [f for f in ledger.get("feed_list", []) if f.get("feed_time", 0) < ft],
         "eat_list": [e for e in ledger.get("eat_list", []) if (e.get("end_time") or 0) < ft],

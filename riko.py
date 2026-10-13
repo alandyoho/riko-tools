@@ -635,6 +635,17 @@ class Riko:
 
         return await note("final")
 
+    async def live_scale(self) -> tuple[float, int]:
+        """Weigh the tray now: (grams on the tray, stored empty-bowl grams).
+
+        bowlStatus only updates when the bowl is taken off or put back; this asks the
+        feeder for a fresh reading (to 0.01 g), and works mid-meal too. Food in the bowl
+        is the first minus the second. A reading near zero means the bowl is off the tray.
+        """
+        res = await self.invoke("iotRead", readType=2)
+        reading = res["data"]["Params"]["str"]
+        return float(reading["gram"]), int(reading["bowlGram"])
+
     async def sync_time(self, source: int = 1) -> Any:
         """Ask the device to re-sync its clock. 0 = from Neakasa backend, 1 = from Aliyun."""
         return await self.invoke("updateTime", type=int(source))
