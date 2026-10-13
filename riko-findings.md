@@ -231,6 +231,11 @@ after the main food drop and between water doses (about 3 g in all). The first s
 of creep came before any water, so that part is food. A food-only trace would confirm
 the rest.
 
+**Update 2026-10-13:** the food-only trace says the extra is not food. 4 g ordered with
+no water arrived as a smooth ramp to 4.00 g and then stayed flat: no overshoot, no
+creep. So the couple of grams a normal meal comes out over arrive during the water
+phase, most likely water dripping after each measured dose. Food portions are accurate.
+
 ### The feeder doses by weight
 *(Found 2026-10-12.)* There is one scale, under the bowl, and the bowl sits on it under
 the outlet for the whole preparation. A live trace of a meal shows the food landing

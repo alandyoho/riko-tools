@@ -131,6 +131,14 @@ would put the excess on the water side, where it's harmless.
   is food still trickling from the grinder (~6 g delivered for 4 g ordered), but weight
   alone can't tell food from water. The test below, run with the scale trace
   (`~/scale_trace.py 4 0` on the Pi), would settle it.
+- **Update 2026-10-13 — it is not food.** Food-only trace, 4 g ordered, no water: the
+  bowl ramped smoothly to 4.00 g over about 54 s and stayed flat for the next 90 s
+  (final 3.97 g, 164 samples). No overshoot and no creep. So food is dosed accurately,
+  and the extra 2-5 g in a normal meal arrives during the water phase: most likely
+  water dripping after each measured dose (0.7-0.9 g after each of four doses in the
+  mixed trace), which the record doesn't count. Not ruled out: water washing down
+  ground food left in the chute. Either way the food-only run delivered what was
+  ordered. A food-only feed has no soak: preparing to served took 51 s.
 - `riko feed 8 0` into a weighed bowl — dry food, no water. Repeat at 4, 8, 16 g.
 - Tip the morsels back into the hopper, or count them against the day's intake.
 - **Why it matters:** decides whether this is a calorie problem or a non-issue.
