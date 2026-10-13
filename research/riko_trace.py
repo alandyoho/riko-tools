@@ -11,9 +11,9 @@ know how much is already in the bowl when a feed stalls, we can add only the
 missing part instead of re-issuing a whole meal.
 
 Usage (from the Pi, or via the `riko` alias pattern):
-    python3 riko_trace.py                    # wait for the next feed, then trace it
-    python3 riko_trace.py --feed 0 24        # trigger a water-only feed and trace it
-    python3 riko_trace.py --feed 8 24 --interval 0.5
+    python3 research/riko_trace.py                    # wait for the next feed, then trace it
+    python3 research/riko_trace.py --feed 0 24        # trigger a water-only feed and trace it
+    python3 research/riko_trace.py --feed 8 24 --interval 0.5
 
 Output: riko_capture/trace_<timestamp>.csv with columns
     elapsed_s, wall_clock, state, state_name, param, bowl_in, scale_g, food_g, delta_g
@@ -28,6 +28,7 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # the repo root: riko.py, config.py
 from config import ConfigError, load as load_config
 from riko import ERROR_CODES, FeederState, Riko
 

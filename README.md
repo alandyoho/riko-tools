@@ -179,7 +179,9 @@ applies from the next meal.
 | `neakasa.py` | Reads the intake ledger — per-meal actual-vs-planned grams, failure reasons, and eat sessions — from Neakasa's feeder backend. Self-sufficient: logs in with your account and needs the feeder owner's user_id (a number, not a secret). See "Intake history" below. |
 | `setup.sh` | Guided setup for the monitor — see below. Start here if you want more than the bowl-weight fix. |
 | `tests/` | Tests for the automatic behavior (top-up, over-dispense alert, clock upkeep, battery, cellular failover, session handling, the water-ratio script), run against a simulated feeder. `tests/run.sh` runs them all; nothing touches the real device. |
-| `riko_discover.py`, `riko_tsl_probe.py`, `riko_trace.py`, `riko_poll.py`, `riko_pump_test.py` | Diagnostic scripts used to produce the findings. |
+| `riko_discover.py` | The capture service (`riko-watch`): records every event the feeder pushes to `riko_capture/`. Uses a separate account so it doesn't knock out the monitor's login. |
+| `oled_status.py` | Optional status display for an OLED bonnet on the Pi; reads the monitor's status file. |
+| `research/` | One-off diagnostic scripts and notes used to produce the findings. Not run by anything. |
 
 `riko.py --help` and each script's header explain usage. Most read credentials from a
 `riko.toml` (see `config.py --example`) or `RIKO_EMAIL` / `RIKO_PASSWORD` env vars.

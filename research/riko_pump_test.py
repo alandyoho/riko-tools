@@ -25,9 +25,9 @@ WHAT YOU LEARN
     drain-back theory) -- the script reports it if that happens
 
 USAGE
-    python3 riko_pump_test.py --dry-run
-    python3 riko_pump_test.py --bowl-g 68.40
-    python3 riko_pump_test.py --bowl-g 68.40 --amounts 12 24 36 24
+    python3 research/riko_pump_test.py --dry-run
+    python3 research/riko_pump_test.py --bowl-g 68.40
+    python3 research/riko_pump_test.py --bowl-g 68.40 --amounts 12 24 36 24
 
 BEFORE RUNNING
   * Clean, DRY bowl in the tray, weighed on your scale -> --bowl-g
@@ -46,6 +46,7 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # the repo root: riko.py, config.py
 from config import ConfigError, load as load_config
 from riko import ERROR_CODES, FeederState, Riko
 

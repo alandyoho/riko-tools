@@ -20,7 +20,8 @@ import os
 import sys
 import time
 
-sys.path.insert(0, "/home/yoho/riko")
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # the repo root: riko.py, config.py
 import riko
 
 POLL_INTERVAL = float(os.environ.get("BATTERY_WATCH_INTERVAL", "20"))

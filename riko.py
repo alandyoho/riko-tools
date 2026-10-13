@@ -616,7 +616,7 @@ class Riko:
         the gap the cat gets under. Priming while the device is still suspended keeps
         the tray retracted, and RESUME lets the firmware finish the meal it started --
         it knows what it has and hasn't dispensed, and we can't ask (curWeight is
-        cached, not live; see riko_trace.py).
+        cached, not live; see research/riko_trace.py).
 
         WHAT'S UNPROVEN: waterProvide has never been observed to move water. Every
         test so far ran with the tray EXTENDED, where the firmware accepts the call

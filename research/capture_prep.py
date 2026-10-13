@@ -6,7 +6,10 @@ what changes in real time while food/water are being prepped.
 import asyncio
 import json
 import os
+import sys
 import time
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # the repo root: riko.py, config.py
 import riko
 
 POLL_INTERVAL = 1.0

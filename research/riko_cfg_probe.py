@@ -12,11 +12,11 @@ may look like an empty string, an error, or a timeout -- all are recorded so
 the pattern is visible afterwards.
 
 USAGE
-    python3 riko_cfg_probe.py --dry-run            # print the wordlist, send nothing
-    python3 riko_cfg_probe.py                      # built-in wordlist
-    python3 riko_cfg_probe.py --names a.cfg b.cfg  # specific names only
-    python3 riko_cfg_probe.py --wordlist my.txt    # one name per line
-    python3 riko_cfg_probe.py --delay 2.0          # slower, gentler on the device
+    python3 research/riko_cfg_probe.py --dry-run            # print the wordlist, send nothing
+    python3 research/riko_cfg_probe.py                      # built-in wordlist
+    python3 research/riko_cfg_probe.py --names a.cfg b.cfg  # specific names only
+    python3 research/riko_cfg_probe.py --wordlist my.txt    # one name per line
+    python3 research/riko_cfg_probe.py --delay 2.0          # slower, gentler on the device
 
 SAFETY
   * Requires the device to be IDLE; refuses otherwise, and stops if it leaves idle.
@@ -34,6 +34,7 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # the repo root: riko.py, config.py
 from config import ConfigError, load as load_config
 from riko import FeederState, Riko
 
