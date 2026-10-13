@@ -119,7 +119,7 @@ async def main():
     class L:
         async def ledger(self, *a, **k): return {"feed_list": [], "eat_list": []}
     mon.neakasa, mon.device_name = L(), "dev"
-    await mon._check_schedule_drift(f.status()); await mon._check_schedule_drift(f.status())
+    await mon._check_missed_meal(f.status()); await mon._check_missed_meal(f.status())
     assert not f.syncs and notes == [("ACT", "03:55 meal hasn't run")], (f.syncs, notes)
     print("l ok: overdue check ->", notes[0][1], "(once, no sync)")
 asyncio.run(main())

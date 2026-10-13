@@ -38,7 +38,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import copy
 import json
 import logging
 import os
@@ -50,8 +49,8 @@ from typing import Any
 
 from config import ConfigError, load as load_config
 from notify import Notifier, NotifyConfig
-from riko import (ERROR_CODES, FeedCtrl, FeederState, FoodLevel, Riko, RikoStatus, WaterLevel,
-                  parse_schedule)
+from riko import (ERROR_CODES, FeedCtrl, FeederState, FoodLevel, Riko, RikoStatus, Schedule,
+                  WaterLevel)
 from neakasa import Feeder as NeakasaFeeder
 import power
 import topup
@@ -198,24 +197,19 @@ def decode_fail_reason(fail_reason_json: str) -> str:
 _LEDGER_WINDOW_MIN = 20  # +/- minutes around a scheduled slot to consider "near"
 
 
+def _tod(t: float | None = None) -> int:
+    """Seconds since local midnight, now or at unix time t."""
+    lt = time.localtime(t)
+    return lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec
+
+
 def _near_a_feed_slot(st: RikoStatus, window_min: int = _LEDGER_WINDOW_MIN) -> bool:
-    plan = st._p("fdPlanStr")
-    if not plan:
+    sched = Schedule.from_status(st)
+    if sched is None:
         return True  # can't read the schedule -> fail open, check anyway
-    try:
-        plan = json.loads(plan) if isinstance(plan, str) else plan
-    except (ValueError, TypeError):
-        return True
-    now = time.localtime()
-    now_sec = now.tm_hour * 3600 + now.tm_min * 60 + now.tm_sec
-    for slot_sec, enabled in zip(plan.get("time", []), plan.get("bEn", [])):
-        if not enabled:
-            continue
-        delta = abs(now_sec - slot_sec)
-        delta = min(delta, 86400 - delta)  # wrap across midnight
-        if delta <= window_min * 60:
-            return True
-    return False
+    now_sec = _tod()
+    return any(abs(Schedule.seconds_since(sl.seconds_from_midnight, now_sec)) <= window_min * 60
+               for sl in sched.slots if sl.enabled)
 
 
 class Monitor:
@@ -249,6 +243,9 @@ class Monitor:
         self._clock_stuck_alerted = False
         self._clock_held_for: str | None = None
         self._jam: dict | None = None      # the grinder fault in progress, if any
+        self._in_pass = False              # inside check(): the ledger is fetched at most once
+        self._pass_ledger: dict | None = None
+        self._pass_ledger_failed = False
         self._warned_food = False
         self._warned_water = False
         self._bowl_back_count = 0    # consecutive polls with bowl detected, while suspended-for-bowl
@@ -297,6 +294,40 @@ class Monitor:
                 f"stop monitoring and protect its disk soon; it restarts when power returns.")
 
     async def check(self) -> None:
+        self._in_pass, self._pass_ledger, self._pass_ledger_failed = True, None, False
+        try:
+            await self._run_checks()
+        finally:
+            self._in_pass = False
+
+    async def _get_ledger(self) -> dict:
+        """The intake ledger for the last two days. Within one check() pass it is fetched
+        once and shared by every check that needs it; a failure is remembered for the
+        rest of the pass too. Raises if it can't be read."""
+        if self._in_pass and self._pass_ledger is not None:
+            return self._pass_ledger
+        if self._in_pass and self._pass_ledger_failed:
+            raise RuntimeError("the ledger could not be read this pass")
+        try:
+            device = self.device_name or await self.neakasa.find_device()
+            try:
+                ledger = await self.neakasa.ledger(device, days=2, owner_user_id=self.feeder_owner_id)
+            except RuntimeError as exc:
+                # 1007 TokenInvalid = the shared session's REST token is stale
+                # (e.g. resumed from an old session file): fresh login, one retry
+                if "code=1007" not in str(exc):
+                    raise
+                log.info("ledger token rejected (1007); re-logging in")
+                await self.r.relogin()
+                ledger = await self.neakasa.ledger(device, days=2, owner_user_id=self.feeder_owner_id)
+        except Exception:
+            self._pass_ledger_failed = True
+            raise
+        if self._in_pass:
+            self._pass_ledger = ledger
+        return ledger
+
+    async def _run_checks(self) -> None:
         try:
             self._check_power()
         except Exception as exc:
@@ -320,7 +351,7 @@ class Monitor:
             await self._keep_clock(st)
         except Exception as exc:
             log.warning("clock upkeep failed: %r", exc)
-        await self._check_schedule_drift(st)
+        await self._check_missed_meal(st)
         await self._check_config_drift(st, self.bowl_grams_target)
         if self.neakasa is not None:
             await self.check_ledger_failures(st)
@@ -337,28 +368,14 @@ class Monitor:
     def _topup_set_pending(self, pending: dict | None) -> None:
         self.store.put_setting("topup_pending", json.dumps(pending) if pending else "")
 
-    @staticmethod
-    def _schedule_plan(st: RikoStatus) -> dict | None:
-        plan = st._p("fdPlanStr")
-        try:
-            plan = json.loads(plan) if isinstance(plan, str) else plan
-        except (ValueError, TypeError):
-            return None
-        if not isinstance(plan, dict) or not all(isinstance(plan.get(k), list) for k in ("time", "food", "water")):
-            return None
-        return plan
-
-    async def _write_schedule(self, plan: dict) -> None:
+    async def _write_schedule(self, sched: Schedule) -> None:
         """Write the schedule and move the config-drift baseline with it, so our own
         change doesn't raise a "Setting changed: schedule" alert."""
-        await self.r.set_schedule_raw(plan)
-        slots = parse_schedule(json.dumps(plan))
-        self.store.put_setting("schedule", _fmt([(s.hhmm, s.food_g, s.water_g, s.enabled) for s in slots]))
+        await self.r.set_schedule_raw(sched.raw)
+        self.store.put_setting("schedule", _fmt([(s.hhmm, s.food_g, s.water_g, s.enabled) for s in sched.slots]))
 
     async def _bowl(self) -> "topup.Bowl | None":
-        device = self.device_name or await self.neakasa.find_device()
-        ledger = await self.neakasa.ledger(device, days=2, owner_user_id=self.feeder_owner_id)
-        return topup.bowl_now(ledger)
+        return topup.bowl_now(await self._get_ledger())
 
     async def _check_topup(self, st: RikoStatus) -> None:
         """Before each meal, serve only what the bowl is missing (see topup.py).
@@ -372,32 +389,28 @@ class Monitor:
         """
         if self.p.topup_mode == "off":
             return
-        plan = self._schedule_plan(st)
-        if plan is None:
+        sched = Schedule.from_status(st)
+        if sched is None:
             return
         pending = self._topup_pending()
         try:
             if pending:
-                await self._topup_follow_up(st, plan, pending)
+                await self._topup_follow_up(st, sched, pending)
             else:
-                await self._topup_decide(st, plan)
+                await self._topup_decide(st, sched)
         except Exception as exc:
             log.warning("top-up check failed: %r", exc)
 
-    async def _topup_decide(self, st: RikoStatus, plan: dict) -> None:
-        lt = time.localtime()
-        now_sec = lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec
+    async def _topup_decide(self, st: RikoStatus, sched: Schedule) -> None:
+        now_sec = _tod()
         lo, hi = (m * 60 for m in self.p.topup_lead_min)
-        day_en = plan.get("bDayEn") or [1] * len(plan["time"])
-        for i, slot_sec in enumerate(plan["time"]):
-            if not (plan.get("bEn") or [1] * len(plan["time"]))[i] or not day_en[i]:
-                continue
-            if lo <= (slot_sec - now_sec) % 86400 <= hi:
-                break
-        else:
+        due = [(i, sl) for i, sl in sched.active_today()
+               if lo <= (sl.seconds_from_midnight - now_sec) % 86400 <= hi]
+        if not due:
             return
+        i, slot = due[0]
+        slot_sec, label = slot.seconds_from_midnight, slot.hhmm
         slot_epoch = int(time.time()) + (slot_sec - now_sec) % 86400
-        label = time.strftime("%H:%M", time.gmtime(slot_sec))
         if self.store.get_setting("topup_last_eval") == f"{_today()} {label}":
             return                                    # already decided for this slot
         if st.state != FeederState.IDLE:
@@ -414,7 +427,7 @@ class Monitor:
             log.info("top-up %s: %s", label, msg)
             return
         self._stale_food_check(bowl)
-        food, water = plan["food"][i], plan["water"][i]
+        food, water = sched.amounts(i)
         decision = topup.plan_topup(food, water, bowl.grams)
         summary = (f"{bowl.grams:.0f} g in the bowl, meal is {food:g}+{water:g} g -> " +
                    (f"serve {decision.food_g}+{decision.water_g} g" if decision.action == "topup"
@@ -427,18 +440,15 @@ class Monitor:
         if observe:
             log.info("top-up %s (observe only): %s", label, summary)
             return
-        new_plan = copy.deepcopy(plan)
-        if decision.action == "skip":
-            new_plan.setdefault("bDayEn", [1] * len(plan["time"]))[i] = 0
-        else:
-            new_plan["food"][i], new_plan["water"][i] = decision.food_g, decision.water_g
+        changed = (sched.with_skipped(i) if decision.action == "skip"
+                   else sched.with_amounts(i, decision.food_g, decision.water_g))
         pending = {"slot_sec": slot_sec, "slot_epoch": slot_epoch, "label": label,
                    "action": decision.action, "orig": [food, water],
                    "new": [decision.food_g, decision.water_g], "leftover": bowl.grams,
                    "saw_cycle": False}
         self._topup_set_pending(pending)              # saved first: a crash after the write still restores
         try:
-            await self._write_schedule(new_plan)
+            await self._write_schedule(changed)
         except Exception:
             self._topup_set_pending(None)
             raise
@@ -453,7 +463,7 @@ class Monitor:
                        f"{decision.food_g} g food + {decision.water_g} g water instead of "
                        f"{food:g} + {water:g}. The schedule goes back to normal after it is served.")
 
-    async def _topup_follow_up(self, st: RikoStatus, plan: dict, pending: dict) -> None:
+    async def _topup_follow_up(self, st: RikoStatus, sched: Schedule, pending: dict) -> None:
         now = time.time()
         slot, label = pending["slot_epoch"], pending["label"]
         if st.state in (FeederState.PREPARING, FeederState.SERVING):
@@ -468,9 +478,9 @@ class Monitor:
             if bowl is None:
                 return
             if topup.handled_since_meal(bowl, st.reported_at("bowlStatus")):
-                await self._topup_restore(plan, pending, "the bowl was taken off or put back")
+                await self._topup_restore(sched, pending, "the bowl was taken off or put back")
             elif topup.plan_topup(*pending["orig"], bowl.grams).action == "full":
-                await self._topup_restore(plan, pending, f"the bowl was emptied ({bowl.grams:.0f} g left)")
+                await self._topup_restore(sched, pending, f"the bowl was emptied ({bowl.grams:.0f} g left)")
             return
         served = pending["saw_cycle"] and now >= slot + 60
         if pending["action"] == "skip":
@@ -479,7 +489,7 @@ class Monitor:
             return
         if st.state != FeederState.IDLE and now < slot + 2 * 3600:
             return                                    # suspended or faulted: wait for it to settle
-        await self._topup_restore(plan, pending, "meal served" if pending["saw_cycle"] else "slot has passed")
+        await self._topup_restore(sched, pending, "meal served" if pending["saw_cycle"] else "slot has passed")
         if pending["action"] == "skip":
             bowl = await self._bowl()
             if bowl is not None and bowl.grams <= topup.EMPTY_G:
@@ -488,28 +498,20 @@ class Monitor:
                     f"The bowl held {pending['leftover']:.0f} g when the {label} meal was skipped and "
                     f"reads {bowl.grams:.0f} g now. Consider a manual feed.")
 
-    async def _topup_restore(self, plan: dict, pending: dict, why: str) -> None:
+    async def _topup_restore(self, sched: Schedule, pending: dict, why: str) -> None:
         label = pending["label"]
-        try:
-            i = plan["time"].index(pending["slot_sec"])
-        except ValueError:
-            i = None                                  # the slot was moved or deleted in the app
+        i = sched.index_of(pending["slot_sec"])       # None: the slot was moved or deleted in the app
         result = "nothing to restore"
         try:
             if i is not None and pending["action"] == "topup":
-                if [plan["food"][i], plan["water"][i]] == pending["new"]:
-                    back = copy.deepcopy(plan)
-                    back["food"][i], back["water"][i] = pending["orig"]
-                    await self._write_schedule(back)
+                if sched.amounts(i) == pending["new"]:
+                    await self._write_schedule(sched.with_amounts(i, *pending["orig"]))
                     result = "restored"
                 else:
                     result = "left alone (edited in the app since)"
             elif i is not None and time.time() < pending["slot_epoch"]:
-                day_en = plan.get("bDayEn") or []
-                if i < len(day_en) and not day_en[i]:  # un-skip: only before the slot, never after
-                    back = copy.deepcopy(plan)
-                    back["bDayEn"][i] = 1
-                    await self._write_schedule(back)
+                if not sched.slots[i].day_enabled:    # un-skip: only before the slot, never after
+                    await self._write_schedule(sched.with_skipped(i, False))
                     result = "un-skipped"
         except Exception as exc:
             log.warning("top-up %s: restore failed (%r); will retry", label, exc)
@@ -916,19 +918,7 @@ class Monitor:
             log.debug("ledger check: not near a feed slot, skipping")
             return
         try:
-            device = self.device_name or await self.neakasa.find_device()
-            try:
-                ledger = await self.neakasa.ledger(device, days=1,
-                                                   owner_user_id=self.feeder_owner_id)
-            except RuntimeError as exc:
-                # 1007 TokenInvalid = the shared session's REST token is stale
-                # (e.g. resumed from an old session file): fresh login, one retry
-                if "code=1007" not in str(exc):
-                    raise
-                log.info("ledger token rejected (1007); re-logging in")
-                await self.r.relogin()
-                ledger = await self.neakasa.ledger(device, days=1,
-                                                   owner_user_id=self.feeder_owner_id)
+            ledger = await self._get_ledger()
         except Exception as exc:
             log.warning("ledger check failed: %r", exc)
             return
@@ -1046,15 +1036,6 @@ class Monitor:
 
 
     # ---- keeping the feeder's clock right ------------------------------------------
-    def _today_slots(self, plan: dict | None) -> list[int]:
-        """Seconds-from-midnight of the meals that are on and not skipped for today."""
-        if not plan:
-            return []
-        times = plan.get("time", [])
-        en = plan.get("bEn") or [1] * len(times)
-        day_en = plan.get("bDayEn") or [1] * len(times)
-        return [sec for sec, e, d in zip(times, en, day_en) if e and d]
-
     def _sync_would_cost_a_meal(self, device_tod: float, drift: float, lead: float,
                                 slots: list[int]) -> str | None:
         """Would correcting the clock right now skip or repeat a meal? Returns that
@@ -1117,11 +1098,10 @@ class Monitor:
                     f"The feeder's clock is {mins / 60:.1f} hours {'behind' if drift > 0 else 'ahead'}. That "
                     f"looks like a timezone setting, not drift, so it was left alone. Check it in the app.")
             return
-        lt = time.localtime(device)
-        device_tod = lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec
+        sched = Schedule.from_status(st)
+        slots = [sl.seconds_from_midnight for _, sl in sched.active_today()] if sched else []
         lead = max(0, st.default_feed.soak_min) * 60
-        meal = self._sync_would_cost_a_meal(device_tod, drift, lead,
-                                            self._today_slots(self._schedule_plan(st)))
+        meal = self._sync_would_cost_a_meal(_tod(device), drift, lead, slots)
         if meal:
             if self._clock_held_for != meal:
                 self._clock_held_for = meal
@@ -1153,98 +1133,45 @@ class Monitor:
                        f"The feeder's clock was {how}. It falls behind after a power interruption. "
                        f"It has been synced, so meals stay on schedule.")
 
-    async def _check_schedule_drift(self, st: RikoStatus) -> None:
-        """Catch clock drift that _check_clock CAN'T see.
+    async def _check_missed_meal(self, st: RikoStatus) -> None:
+        """Alert, once, when a meal is overdue with no record of it.
 
-        _check_clock only compares the device's timezone/DST-derived effective
-        offset against real time -- it's blind to fine-grained clock skew, since
-        the timezone config can be perfectly correct (zone=-5, dst=1) while the
-        device's underlying clock is simply running minutes behind or ahead. We
-        found exactly this on 2026-09-28: zone/DST config correct, device clock
-        29 minutes slow, so a 19:55 slot silently never fired -- no error, no
-        suspension, no ledger entry, nothing for any other check to catch. The
-        app showed "Expired"; nothing on our side did until this was added.
+        A meal that fails normally leaves a failed ledger entry or a suspended state,
+        and other checks own those. This is for the meal that never started at all:
+        a slow clock (the feeder may still serve it late), or the feeder asleep on
+        battery. A meal skipped for today in the app is expected to have no record.
 
-        There's no live "what time does the device think it is" property to read
-        (the `timestamp` property is a stale one-time value from setup, confirmed
-        useless for this). So detection is indirect: if wall-clock time is past an
-        enabled slot by more than missed_feed_grace_min minutes and the ledger has
-        no record anywhere near that slot, the most likely explanation is clock
-        drift (as opposed to a real failure, which normally DOES leave a FAILED
-        ledger entry or a SUSPENDED state -- see check_ledger_failures and
-        _handle_suspension for those). Fix: call sync_time(), which the 2026-09-28
-        incident confirmed both corrects the clock AND makes the device
-        immediately fire the slot it had been sitting on.
-
-        Update 2026-10-12: that only holds within about 5 minutes of the slot. Past
-        that, the jump makes the feeder skip the meal. So this check now only alerts;
-        the syncing lives in _keep_clock.
+        It only alerts. It used to sync the clock here, and on 2026-10-12 that sync,
+        6 minutes after the 03:55 slot, jumped the feeder's clock past the meal and
+        made it "Expired". _keep_clock now corrects the clock ahead of time.
         """
         if self.neakasa is None:
-            return  # needs the ledger to confirm a slot is truly unrecorded, not just quiet
-
-        plan = st._p("fdPlanStr")
-        if not plan:
+            return                              # needs the ledger to know a meal has no record
+        sched = Schedule.from_status(st)
+        if sched is None:
+            return
+        now_sec, grace = _tod(), self.p.missed_feed_grace_min * 60
+        # earlier today only: just after midnight the skip flags have reset, so a meal
+        # skipped late yesterday would look missed
+        overdue = next((sl for _, sl in sched.active_today()
+                        if grace < now_sec - sl.seconds_from_midnight < grace + 3600), None)
+        if overdue is None:
             return
         try:
-            plan = json.loads(plan) if isinstance(plan, str) else plan
-        except (ValueError, TypeError):
-            return
-
-        now = time.localtime()
-        now_sec = now.tm_hour * 3600 + now.tm_min * 60 + now.tm_sec
-        grace_sec = self.p.missed_feed_grace_min * 60
-        overdue_slot = None
-        times = plan.get("time", [])
-        day_en = plan.get("bDayEn") or [1] * len(times)
-        for slot_sec, enabled, today in zip(times, plan.get("bEn", []), day_en):
-            # bDayEn=0 means skipped for today in the app (it resets to 1 at
-            # midnight, and stays 1 both when a slot fires and when drift makes
-            # it miss) — a skipped slot is expected to have no ledger record
-            if not enabled or not today:
-                continue
-            # only look at slots that have already passed today, within a sane
-            # lookback window (avoid matching a slot from ~24h ago after midnight)
-            if grace_sec < (now_sec - slot_sec) < grace_sec + 3600:
-                overdue_slot = slot_sec
-                break
-        if overdue_slot is None:
-            return
-
-        slot_label = time.strftime("%H:%M", time.gmtime(overdue_slot))
-        try:
-            device = self.device_name or await self.neakasa.find_device()
-            ledger = await self.neakasa.ledger(device, days=1,
-                                               owner_user_id=self.feeder_owner_id)
+            ledger = await self._get_ledger()
         except Exception as exc:
-            log.warning("schedule-drift check: ledger fetch failed: %s", exc)
+            log.warning("missed-meal check: ledger fetch failed: %r", exc)
             return
-
-        today = time.strftime("%Y-%m-%d")
-        found = False
-        for f in ledger.get("feed_list", []):
-            ft = time.localtime(f.get("feed_time", 0))
-            if time.strftime("%Y-%m-%d", ft) != today:
-                continue
-            f_sec = ft.tm_hour * 3600 + ft.tm_min * 60
-            if abs(f_sec - overdue_slot) < grace_sec + 300:  # small slack either side
-                found = True
-                break
-        if found:
-            return  # the slot has a record -- not a drift case, some other check owns it
-
-        # Alert only. This used to sync the clock here, which is what skipped the
-        # 03:55 meal on 2026-10-12: the feeder was 22.7 minutes slow and would have
-        # served late on its own, but a sync 6 minutes after the slot jumped its clock
-        # past the meal and it marked it "Expired". _keep_clock now reads the feeder's
-        # clock directly and corrects it as soon as it is wrong.
-        notified_key = f"meal_overdue_notified_{today}"
-        if self.store.get_setting(notified_key) == slot_label:
+        due_at = time.time() - (now_sec - overdue.seconds_from_midnight)
+        if any(abs(f.get("feed_time", 0) - due_at) < grace + 300 for f in ledger.get("feed_list", [])):
+            return                              # it has a record; other checks own that
+        notified_key = f"meal_overdue_notified_{_today()}"
+        if self.store.get_setting(notified_key) == overdue.hhmm:
             return
-        self.store.put_setting(notified_key, slot_label)
+        self.store.put_setting(notified_key, overdue.hhmm)
         self.n.action_needed(
-            f"{slot_label} meal hasn't run",
-            f"The {slot_label} meal is more than {self.p.missed_feed_grace_min:.0f} minutes overdue "
+            f"{overdue.hhmm} meal hasn't run",
+            f"The {overdue.hhmm} meal is more than {self.p.missed_feed_grace_min:.0f} minutes overdue "
             f"with no record of it. If the feeder's clock is behind it may still serve late by "
             f"itself; if the app shows it as Expired, feed manually.")
 

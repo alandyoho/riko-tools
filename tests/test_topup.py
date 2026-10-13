@@ -30,7 +30,21 @@ b = TU.bowl_now({"feed_list": [{"feed_time": 100, "left_weight": 64, "status": 1
 assert (b.grams, b.as_of, b.last_feed_at) == (48, 500, 500), b      # 24 left + a water-only feed with no bowl reading
 assert TU.bowl_now({"feed_list": [], "eat_list": []}) is None
 assert TU.handled_since_meal(b, 500 + 3600) and not TU.handled_since_meal(b, 500 + 30) and not TU.handled_since_meal(b, None)
-print("unit ok: plan_topup, bowl_now, handled_since_meal")
+# ---- the schedule model ---------------------------------------------------------
+from riko import Schedule
+RAW = {"bEn": [1, 1, 0], "bDayEn": [1, 0, 1], "time": [14100, 28500, 42900], "food": [3, 8, 8], "water": [21, 56, 56]}
+sc = Schedule.from_status(RikoStatus({"fdPlanStr": {"value": json.dumps(RAW)}}))
+assert [i for i, _ in sc.active_today()] == [0] and sc.slots[0].hhmm == "03:55"
+assert sc.index_of(28500) == 1 and sc.index_of(999) is None and sc.amounts(1) == [8, 56]
+edited = sc.with_amounts(1, 4, 28); skipped = sc.with_skipped(0)
+assert edited.amounts(1) == [4, 28] and sc.amounts(1) == [8, 56], "edits must not change the original"
+assert skipped.raw["bDayEn"][0] == 0 and sc.raw["bDayEn"][0] == 1 and skipped.with_skipped(0, False).raw == sc.raw
+no_flags = Schedule({"time": [14100], "food": [3], "water": [21]})
+assert [i for i, _ in no_flags.active_today()] == [0] and "bDayEn" not in no_flags.raw
+assert no_flags.with_skipped(0).raw["bDayEn"] == [0]
+assert Schedule.from_status(RikoStatus({})) is None and Schedule.from_status(RikoStatus({"fdPlanStr": {"value": "not json"}})) is None
+assert Schedule.seconds_since(86100, 300) == 600 and Schedule.seconds_since(300, 86100) == -600      # across midnight
+print("unit ok: plan_topup, bowl_now, handled_since_meal, Schedule")
 
 # ---- the flow -----------------------------------------------------------------
 clock = {"now": 0.0}

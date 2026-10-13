@@ -18,6 +18,7 @@ Unofficial. The vendor can change the cloud or firmware at any time.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import time
@@ -182,6 +183,61 @@ def parse_schedule(plan_str: str) -> list[FeedSlot]:
             col("bEn", 0), col("bDayEn", 0), col("time", 0), col("food", 0),
             col("water", 0), col("rept", 127), col("aud", 0), col("type", 1))
     ]
+
+
+class Schedule:
+    """The feeder's meal plan (the fdPlanStr property).
+
+    The device stores it as one dict of parallel lists (time, bEn, bDayEn, food,
+    water, ...). `slots` is that parsed for reading; `raw` is the dict as the device
+    sent it, so an edit writes back exactly what was read plus the change.
+    """
+
+    def __init__(self, raw: dict[str, Any]) -> None:
+        self.raw = raw
+        n = len(raw.get("time", []))
+        defaults = {"bEn": [1] * n, "bDayEn": [1] * n}       # a missing flag list means "all on"
+        self.slots = parse_schedule(json.dumps({**defaults, **{k: v for k, v in raw.items() if v}}))
+
+    @classmethod
+    def from_status(cls, st: "RikoStatus") -> "Schedule | None":
+        """The schedule in a status read, or None if it is missing or malformed."""
+        plan = st._p("fdPlanStr")
+        try:
+            plan = json.loads(plan) if isinstance(plan, str) else plan
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(plan, dict) or not all(isinstance(plan.get(k), list) for k in ("time", "food", "water")):
+            return None
+        return cls(plan)
+
+    def active_today(self) -> list[tuple[int, FeedSlot]]:
+        """(index, slot) for meals that are on and not skipped for today. The skip flag
+        (bDayEn) is what the app's "skip today" sets; it resets itself at midnight."""
+        return [(i, sl) for i, sl in enumerate(self.slots) if sl.enabled and sl.day_enabled]
+
+    def index_of(self, seconds_from_midnight: int) -> int | None:
+        times = self.raw.get("time", [])
+        return times.index(seconds_from_midnight) if seconds_from_midnight in times else None
+
+    def amounts(self, i: int) -> list[float]:
+        """[food, water] for slot i, as the device reports them."""
+        return [self.raw["food"][i], self.raw["water"][i]]
+
+    def with_amounts(self, i: int, food: float, water: float) -> "Schedule":
+        raw = copy.deepcopy(self.raw)
+        raw["food"][i], raw["water"][i] = food, water
+        return Schedule(raw)
+
+    def with_skipped(self, i: int, skipped: bool = True) -> "Schedule":
+        raw = copy.deepcopy(self.raw)
+        raw.setdefault("bDayEn", [1] * len(raw["time"]))[i] = 0 if skipped else 1
+        return Schedule(raw)
+
+    @staticmethod
+    def seconds_since(slot_sec: int, now_sec: int) -> int:
+        """Seconds since a slot's time of day, wrapped to -12 h .. +12 h (negative = still to come)."""
+        return (now_sec - slot_sec + 43200) % 86400 - 43200
 
 
 @dataclass(frozen=True)

@@ -78,4 +78,25 @@ async def main():
     assert mon.neakasa.k == 2 and mon.r.n == 1
     print("5 ok: ledger 1007 retried once after a fresh login")
 
+    # 6. within one pass the ledger is fetched once and shared; a failure isn't retried in that pass
+    class CountingLedger:
+        calls = 0; broken = False
+        async def ledger(self, *a, **kw):
+            self.calls += 1
+            if self.broken: raise TimeoutError()
+            return {"feed_list": [], "eat_list": []}
+    mon = M.Monitor(FakeR(), M.Store(Path(tempfile.mkdtemp()) / "m.db"), notifier,
+                    M.Policy(killswitch=Path("/nonexistent")), 0, False, neakasa=CountingLedger(), device_name="dev")
+    mon._in_pass = True
+    first = await mon._get_ledger(); assert await mon._get_ledger() is first and mon.neakasa.calls == 1
+    mon._in_pass = False
+    await mon._get_ledger(); assert mon.neakasa.calls == 2, "no caching outside a pass"
+    mon._in_pass, mon._pass_ledger, mon._pass_ledger_failed = True, None, False
+    mon.neakasa.broken = True
+    for _ in range(3):
+        try: await mon._get_ledger(); raise AssertionError("should have raised")
+        except (TimeoutError, RuntimeError): pass
+    assert mon.neakasa.calls == 3, mon.neakasa.calls
+    print("6 ok: one ledger fetch per pass, shared; a failed fetch isn't repeated in the same pass")
+
 asyncio.run(main())
