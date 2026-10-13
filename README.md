@@ -174,7 +174,8 @@ applies from the next meal.
 | `topup.py` | The arithmetic behind the monitor's meal top-up — see "Stop meals stacking up" below. |
 | `wifi_failover.py` + `failover-setup.sh` | Optional, needs a cellular modem on the Pi: when the home Wi-Fi disappears, the Pi becomes a hotspot with the same name and routes the feeder over cellular. Details in the script headers. |
 | `riko.py` | Full command-line control of the feeder: status, feed now, edit the schedule, set the tare, set the timezone, decode errors, recover a stalled pump. |
-| `monitor.py` + `notify.py` + `config.py` | A background monitor (systemd-friendly) that watches for missed feeds, pump stalls, clock drift, low food/water and **setting changes**, fixes the safe cases under hard caps, and pushes phone notifications via [ntfy](https://ntfy.sh). |
+| `monitor.py` + `notify.py` + `config.py` | A background monitor (systemd-friendly) that watches for missed and failed feeds, pump stalls, grinder jams, extra uncounted food, a wrong clock, low food/water and **setting changes**, fixes the safe cases under hard caps, and pushes phone notifications via [ntfy](https://ntfy.sh). |
+| `power.py` + `power_guard.py` + `power-setup.sh` | Optional, needs a Waveshare UPS HAT (C) on the Pi: battery alerts and a safe low-battery state. See "Battery backup for the Pi" below. |
 | `neakasa.py` | Reads the intake ledger — per-meal actual-vs-planned grams, failure reasons, and eat sessions — from Neakasa's feeder backend. Self-sufficient: logs in with your account and needs the feeder owner's user_id (a number, not a secret). See "Intake history" below. |
 | `setup.sh` | Guided setup for the monitor — see below. Start here if you want more than the bowl-weight fix. |
 | `tests/` | Tests for the automatic behavior (top-up, over-dispense alert, clock upkeep, battery, cellular failover, session handling, the water-ratio script), run against a simulated feeder. `tests/run.sh` runs them all; nothing touches the real device. |
@@ -269,6 +270,71 @@ and `--dry-run` both put it back to observe-only without a restart.
 bowl, not exactly on it. It only knows grams, so water left from a water-only manual feed
 counts as leftover. Old food stays under the new food — hence the 12-hour notification.
 
+### Catch food the feeder doesn't count
+
+**The problem:** the feeder grinds until its scale sees the target weight, and its record
+of a meal always says exactly what was planned. Food that hangs up on the way to the bowl
+and drops later isn't counted — and it lands dry, on top of the soaked meal. We've seen
+9–12 g extra on three meals out of about a hundred, and about 56 g at once after a
+grinder jam.
+
+**What the monitor does:**
+
+- **After every meal** it compares the bowl's weight with what should be there (what was
+  left before, plus what the feeder says it served) and notifies you if the bowl is 8 g
+  or more over. It stays quiet if the bowl was handled before the meal, because the
+  "left before" figure can't be trusted then.
+- **When the grinder jams** you get one notification (not one every 30 seconds) with the
+  bowl's current weight and this advice: **take the bowl off before you resume or clear
+  the jam.** Food that built up behind it can drop all at once. While the feeder is
+  stuck the monitor keeps weighing the bowl and tells you if food drops in.
+
+It never retries a grinder fault by itself.
+
+### Keep the feeder's clock right
+
+**The problem:** unplugging the feeder for even a few minutes knocks its clock back by
+20–30 minutes (5 minutes unplugged left it 28 minutes slow; 3 minutes, 23 minutes slow),
+and it never corrects itself. Every meal then runs that late, and the app says nothing.
+
+**What the monitor does:** every two minutes it asks the feeder what time it thinks it is
+and compares that with its own clock. If they differ by 10 seconds or more it syncs the
+feeder, checks that the sync took, and notifies you once ("Feeder clock was 22.7 min slow
+— synced").
+
+The one time it waits is when the correction itself would cost a meal: a clock that jumps
+from before a meal's start to more than a few minutes past its slot makes the feeder mark
+that meal "Expired" instead of serving it. Then it lets the meal run on the feeder's clock,
+tells you so, and syncs straight after.
+
+This needs the machine running the monitor to keep correct time and to be set to the same
+timezone as the feeder. An error of hours is treated as a timezone setting and left alone.
+
+### Battery backup for the Pi (optional)
+
+With a Waveshare UPS HAT (C) on the Pi (it reports over I2C at address 0x43), run once:
+
+```bash
+sudo ./power-setup.sh
+```
+
+- **"Power is out"** after a minute on battery, **"Pi battery low"** at 3.55 V, and
+  **"Power is back"** when wall power returns. A power cut usually takes the router down
+  too, so an alert that can't be sent is retried until it gets out.
+- **At 3.40 V the Pi goes into "safe idle"** instead of shutting down: it stops the
+  monitor, makes its disk read-only so a sudden cut can't corrupt it, and keeps watching
+  the UPS. When the charger has been back for 30 seconds it reboots itself. (A normal
+  shutdown would leave it off for good — the UPS keeps powering the halted board, so
+  nothing wakes it.)
+
+Measured with a Pi Zero 2 W, an OLED and a 4G modem: about 0.5 A from the battery when
+idle, 1.07 A peak with the modem transmitting, roughly two hours on the 1000 mAh cell.
+The alerts have been tested on real power loss; the safe-idle step has only been tested
+in simulation so far.
+
+The feeder has its own battery, but it sleeps on battery and has missed scheduled meals
+in that state, so the Pi staying up tells you about an outage — it doesn't guarantee meals.
+
 ---
 
 ## Intake history (what the cat actually ate)
@@ -300,18 +366,35 @@ Written up as daily reviews as the investigation went. Short version:
 
 - **Daylight saving time was ignored** (fixed by Neakasa in firmware 1.0.0-0023). Before
   that, every scheduled meal fired an hour late and the app marked it "Expired."
-- **The 1.0.0-0023 update broke the rehydration soak.** Scheduled meals now serve
-  immediately after grinding with no soak, and the soak setting is ignored. This is the
-  feeder's core function; details in the day-4/day-5 writeups.
-- **The bowl-weight default is wrong** (above), and the app re-breaks it after updates.
-- **The food-level sensor false-alarms** "low food" on a full bin.
+- **The 1.0.0-0023 update broke the rehydration soak; 1.0.0-0033 has it working.** Both
+  scheduled and manual meals now soak for the set time (measured: served exactly 10
+  minutes after the last water went in). The setting tops out at 10 minutes — the feeder
+  stores a longer value but still soaks for 10.
+- **The bowl-weight default was wrong** (above), and the app re-broke it after updates.
+  It has held for us since 1.0.0-0033; the fix script remains for anyone who needs it.
+- **The food-level sensor false-alarmed** "low food" on a full bin on earlier firmware.
+  It appears fixed in 1.0.0-0033.
+- **The app caps the food-to-water ratio at 1:5**, but the feeder accepts more (above).
+- **The feeder doses by weight, on one scale under the bowl.** A scale trace of a meal
+  shows the food arriving, then the water in equal measured doses. Its record of a
+  successful meal always equals the plan, so food it didn't see arrive isn't counted —
+  which is how dry food ends up on top of a meal, and how a grinder jam can end in a
+  large uncounted dump.
+- **Its clock falls 20–30 minutes behind after being unplugged briefly** and doesn't
+  correct itself, so every later meal runs late.
+- **Taking the bowl off is logged as the cat eating** whatever was in it, and after the
+  bowl is put back the feeder reports no eating until the next meal starts.
+- **One login per account.** A second login anywhere (the app, a script) knocks out the
+  first, so automation and the app fight each other.
+- **The feeder will report its live scale reading and its own clock on request** (a
+  diagnostic read, not a normal property). The monitor uses both.
 - **Battery/scheduled feeds are unreliable.** On battery the feeder sleeps and sometimes
   wakes near a slot but declines to feed; manual feeds on battery work fine. A power cut
   can mean missed meals with no notification (in a real outage your wifi is down too).
 - **Intake data lives only on Neakasa's backend** and never crosses the device channel,
   so the device-control API can't see what the cat actually ate.
 
-See the `*-review.md` and `riko-findings.md` files for the full, evidence-backed detail.
+See `riko-findings.md` and `TESTS.md` for the evidence behind each of these.
 
 ---
 

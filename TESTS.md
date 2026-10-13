@@ -124,6 +124,13 @@ which matters for the cat.
 run longer when food is present, to wash the ground food through the chute. That
 would put the excess on the water side, where it's harmless.
 
+- **Update 2026-10-12:** a live scale trace of a 4 g + 28 g meal (see Answered) ended
+  2 g over with the four water doses totalling 28.2 g — the excess came in as a slow
+  creep after the main food drop and between water doses, about 3 g in all. The first
+  stretch of creep came before any water, so that part is food. Likely the whole excess
+  is food still trickling from the grinder (~6 g delivered for 4 g ordered), but weight
+  alone can't tell food from water. The test below, run with the scale trace
+  (`~/scale_trace.py 4 0` on the Pi), would settle it.
 - `riko feed 8 0` into a weighed bowl — dry food, no water. Repeat at 4, 8, 16 g.
 - Tip the morsels back into the hopper, or count them against the day's intake.
 - **Why it matters:** decides whether this is a calorie problem or a non-issue.
@@ -287,7 +294,8 @@ schedule, or a power blip. Not a Riko problem but worth finding.
   is ready *at* the slot time, then holds the soaked food until the slot before
   serving. The 16:00 meal: PREPARING 15:50:02, SERVING 16:00:01, IDLE 16:00:06 —
   exact to the second. The noon slot's 11:50 start was this, not a bug.
-- **2026-09-07 — Do scheduled feeds apply the soak?** Yes; manual feeds don't. The
+- **2026-09-07 — Do scheduled feeds apply the soak?** Yes; manual feeds don't (on
+  firmware 0023 — they do on 0033, see 2026-10-12 below). The
   16:00 meal ground early then showed a 6:50 countdown before serving. Note the
   soak setting is effectively a *minimum* — the real hold is whatever time is left
   between finishing the grind and the scheduled slot.
@@ -354,3 +362,56 @@ schedule, or a power blip. Not a Riko problem but worth finding.
   (28 + 32 = 60). The feed record's own `left_weight` said 70 g — 10 g high, cause
   unknown. So: a rewrite 16 min ahead is honored, and a 4 g scheduled portion works.
   Not yet seen live: the skip path, portions of 1–2 g, the 12-hour stale-food alert.
+- **2026-10-09 — Can the Pi (Zero 2 W + OLED + SIM7600 modem) run from the UPS HAT (C)?**
+  Yes. INA219 at I2C 0x43, shunt 0.01 Ω (settled by unplugging: −500 mA only makes sense
+  at that value). On battery: ~0.5 A at 3.96 V idle (~2 W); with the cellular link up
+  and pinging, average 570 mA, peak 1,069 mA, lowest 3.85 V, no undervoltage
+  (`vcgencmd get_throttled` 0x0), no restart. Charges at ~440 mA near full. Roughly two
+  hours on the 1000 mAh cell; tested near full charge only. Plugging wall power back in
+  does not restart the Pi. "Power is out" / "Power is back" alerts verified on real
+  unplugs (2026-10-10; the first try produced nothing because the plug went back in
+  just under the 2-minute wait, now 1 minute). Not yet run for real: safe idle at
+  3.40 V and the self-reboot when the charger returns.
+- **2026-10-11 — Does the feeder ever put more in the bowl than it records?** Yes. The
+  19:55 meal was recorded as a normal 8 + 56 g with a 600 s prep, but the bowl read 76 g
+  after serving and there was dry food lying on top of the soaked meal; 12 g was
+  removed by hand to bring it to 64 g. Bowl-after-serving minus (leftover + recorded
+  amounts) over 100 meals since 09-24: normally 0–3 g; three meals 8 g or more over
+  (09-25 +9, 10-09 +10, 10-11 +12). The Pi had sent the feeder no commands that day.
+- **2026-10-12 — Why did the 03:55 meal show "Expired"?** Two causes. (1) The feeder was
+  unplugged 20:17–20:20 the evening before (to untangle cables) and its clock came back
+  22.7 min slow: the 23:55 meal started preparing at 00:07:43 and its midnight rollover
+  arrived at 00:22:43. Same pattern on 09-27: on battery 20:32–20:37, then four meals
+  each 28.2 min late. The lost time is not the outage length. (2) The monitor's
+  overdue check synced the clock at 04:01, 6 minutes after the slot; the clock jumped
+  from ~03:38 past the meal and the feeder marked it Expired (left alone it would have
+  served at ~04:17). On 09-28 a sync landing 5 minutes after a slot did serve, so the
+  cutoff is between 5 and 6 minutes. Fixed by reading the feeder's clock directly and
+  never syncing across an unserved meal.
+- **2026-10-12 — Can the feeder's clock and scale be read directly?** Yes, with the
+  `iotRead` service: type 0 returns its local time (matched the Pi to the second),
+  type 2 a live scale reading to 0.01 g (it works mid-meal), type 4 the food-bin
+  infrared value (632 with food in; "empty" fired at 952), type 3 power. Earlier notes
+  that the bowl weight is never live, and that the device clock can't be read, were
+  wrong on this point.
+- **2026-10-12 — How does the feeder know how much it has dispensed?** By weight, on the
+  one scale under the bowl. Live trace of a manual 4 + 28 g meal, 871 samples: food
+  landed in the first 26 s (3.65 g), then four water doses of 7.02, 7.04, 7.08 and
+  7.02 g about 25 s apart, done by 140 s; flat at 34.0–34.2 g through the soak; served
+  at 743 s, exactly 10 minutes after the last dose, with no change in weight. So manual
+  feeds do soak on 0033. The feeder recorded exactly 4 + 28 and "bowl after 33 g".
+  Supporting: its error list has "cat interference" codes for food (15) and water (72)
+  dispensing; cut-short meals get water in proportion to the food that arrived (2 g →
+  10 g, 4 g → 20 g at 1:5; 1 g → 7 g at 1:7); a recorded food amount always equals the
+  plan on success (174 of 174) while water varies by a gram or two.
+- **2026-10-12 — What happens when the grinder jams mid-meal?** The 19:55 meal: food
+  bin empty at 19:48:43 (suspended), lid opened and refilled at 19:49:33, resumed
+  19:50:28, "grinder jammed with food" (code 13) at 19:52:16. A resume sent from the
+  app did not clear it. When the feeder was opened, a large amount of dry food was
+  already in the bowl on top of the food-and-water mix; it was thrown out. The record
+  for that meal: 0 g food + 27 g water, bowl after 83 g — about 56 g uncounted.
+  Whether it dropped at the app resume or earlier is unknown. Past jams (09-17 to
+  09-25) were all cleared by hand; left alone the feeder gives up after 10 minutes and
+  serves what it has. The monitor now alerts once per jam with the bowl's weight and
+  "take the bowl off first", watches the scale while stuck, and checks failed meals
+  for uncounted food.
