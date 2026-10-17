@@ -371,6 +371,12 @@ schedule, or a power blip. Not a Riko problem but worth finding.
   (28 + 32 = 60). The feed record's own `left_weight` said 70 g — 10 g high, cause
   unknown. So: a rewrite 16 min ahead is honored, and a 4 g scheduled portion works.
   Not yet seen live: the skip path, portions of 1–2 g, the 12-hour stale-food alert.
+- **2026-10-17 — Is the ledger current enough on an 11-meal schedule?** No. At 07:39 it
+  still said 30 g in the bowl and the 07:55 meal was skipped; the cat had eaten between
+  07:35 and 07:45, but that 10-minute eating window wasn't logged until after the
+  decision, and he went two hours with nothing. Top-up now weighs the bowl with the
+  live scale (`iotRead` type 2) and re-weighs every pass until prep starts: a skip can
+  turn into a top-up or back into the full meal (tests/test_topup.py, case M).
 - **2026-10-09 — Can the Pi (Zero 2 W + OLED + SIM7600 modem) run from the UPS HAT (C)?**
   Yes. INA219 at I2C 0x43, shunt 0.01 Ω (settled by unplugging: −500 mA only makes sense
   at that value). On battery: ~0.5 A at 3.96 V idle (~2 W); with the cellular link up

@@ -230,8 +230,8 @@ steps.
 still in the bowl. If the cat sleeps through the midnight and 4 am meals, breakfast lands
 on both of them — we found bowls holding 91 g and 141 g in the morning.
 
-**What the monitor does about it:** about 15 minutes before each meal it reads how much is
-left in the bowl, then:
+**What the monitor does about it:** about 15 minutes before each meal it weighs the bowl
+with the feeder's live scale, then:
 
 - **Under 10 g left:** nothing. The meal is served as scheduled.
 - **Some left:** it rewrites that one meal to serve only the difference, at the meal's own
@@ -240,24 +240,28 @@ left in the bowl, then:
 - **A full meal's worth left:** it marks that meal "skip today" (the same flag the app
   uses, which clears itself at midnight).
 
+It keeps weighing until the feeder starts preparing, 10 minutes before the meal. If the
+cat eats in the meantime, the decision follows: a skip becomes a smaller top-up, or the
+full meal goes back. (A few grams either way changes nothing.) After that the decision is
+final.
+
 Once the meal has been served — or 30 minutes after the slot — it puts the original
 amounts back. The originals are saved before anything is changed, so a restart mid-way
 still restores them. You get a low-priority notification each time it changes a meal.
 
 **It stands back when it can't trust the reading:**
 
-- If the bowl has been taken off or put back since the last meal, the scheduled meal is
-  served as normal. (After the bowl is handled, the feeder stops reporting what is in it
-  until the next meal starts.)
-- If the bowl is emptied, or swapped, after a change was made but before the feeder
-  starts preparing, the full meal goes back.
+- If the bowl is off the tray, or the scale doesn't answer, the scheduled meal is served
+  as normal. Lifting the bowl after a change was made (before the feeder starts
+  preparing) puts the full meal back.
 - If you edit that meal in the app in the meantime, your edit is left alone.
 - If the Pi is offline or the records can't be read, nothing is changed.
 
 It also notifies you when food has been sitting in the bowl for 12 hours — the feeder
 can't clear the bowl itself.
 
-**Turning it on.** It needs the intake ledger (see "Intake history" below). It starts in
+**Turning it on.** The 12-hour notification needs the intake ledger (see "Intake history"
+below). It starts in
 observe-only mode: it logs what it would do before each meal and changes nothing. After
 a day of that looking right, add this line to the `.env` file and restart the service:
 

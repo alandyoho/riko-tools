@@ -374,18 +374,33 @@ class Monitor:
         await self.r.set_schedule_raw(sched.raw)
         self.store.put_setting("schedule", _fmt([(s.hhmm, s.food_g, s.water_g, s.enabled) for s in sched.slots]))
 
-    async def _bowl(self) -> "topup.Bowl | None":
-        return topup.bowl_now(await self._get_ledger())
+    async def _bowl_now(self) -> float | None:
+        """Grams of food in the bowl right now, from the live scale. None if the bowl is
+        off the tray or the scale didn't answer — then the meal is left alone."""
+        try:
+            gram, bowl = await self.r.live_scale()
+        except Exception as exc:
+            log.info("top-up: couldn't read the scale: %r", exc)
+            return None
+        if gram < bowl / 2:
+            return None                               # the bowl is off the tray
+        return max(0.0, gram - bowl)
 
     async def _check_topup(self, st: RikoStatus) -> None:
         """Before each meal, serve only what the bowl is missing (see topup.py).
 
         About 15 minutes before a slot — the feeder starts preparing 10 minutes
-        before — read what is left in the bowl and rewrite that slot's food and water
-        to the difference, or mark it skipped for today if the bowl already holds a
-        meal. Once the meal has been served (or 30 minutes after the slot) the
-        original amounts go back. The originals are saved before anything is written,
-        so a restart mid-way still restores them.
+        before — weigh the bowl with the live scale and rewrite that slot's food and
+        water to the difference, or mark it skipped for today if the bowl already holds
+        nearly a meal. Until the feeder starts preparing, keep weighing: if the cat eats
+        in the meantime, change or undo the decision. Once the meal has been served (or
+        30 minutes after the slot) the original amounts go back. The originals are saved
+        before anything is written, so a restart mid-way still restores them.
+
+        This used to read the bowl from the intake ledger, which logs eating in
+        10-minute windows. On 2026-10-17 the cat ate between 07:35 and 07:45, but at
+        07:39 the ledger still said 30 g and the 07:55 meal was skipped: he went two
+        hours with nothing. The live scale sees eating as it happens.
         """
         if self.p.topup_mode == "off":
             return
@@ -401,6 +416,23 @@ class Monitor:
         except Exception as exc:
             log.warning("top-up check failed: %r", exc)
 
+    @staticmethod
+    def _topup_summary(grams: float, food: float, water: float, decision: "topup.Plan") -> str:
+        return (f"{grams:.0f} g in the bowl, meal is {food:g}+{water:g} g -> " +
+                (f"serve {decision.food_g}+{decision.water_g} g" if decision.action == "topup"
+                 else decision.action))
+
+    def _topup_notify(self, label: str, grams: float, food: float, water: float, decision: "topup.Plan") -> None:
+        if decision.action == "skip":
+            self.n.fyi(f"{label} meal skipped — bowl still full",
+                       f"{grams:.0f} g is still in the bowl, nearly a full {food + water:g} g meal, "
+                       f"so the {label} meal is skipped for today.")
+        else:
+            self.n.fyi(f"{label} meal topped up",
+                       f"{grams:.0f} g is still in the bowl, so the {label} meal will be "
+                       f"{decision.food_g} g food + {decision.water_g} g water instead of "
+                       f"{food:g} + {water:g}. The schedule goes back to normal after it is served.")
+
     async def _topup_decide(self, st: RikoStatus, sched: Schedule) -> None:
         now_sec = _tod()
         lo, hi = (m * 60 for m in self.p.topup_lead_min)
@@ -415,23 +447,17 @@ class Monitor:
             return                                    # already decided for this slot
         if st.state != FeederState.IDLE:
             return                                    # asleep on battery, suspended, mid-meal
-        bowl = await self._bowl()
+        grams = await self._bowl_now()
         self.store.put_setting("topup_last_eval", f"{_today()} {label}")
-        if bowl is None:
-            log.info("top-up %s: no bowl reading in the ledger; leaving the meal alone", label)
-            return
-        if topup.handled_since_meal(bowl, st.reported_at("bowlStatus")):
-            # the ledger goes quiet after the bowl is taken off or put back (topup.py)
-            msg = f"bowl was handled since the last meal (ledger says {bowl.grams:.0f} g); leaving the meal alone"
+        if grams is None:
+            msg = "no live reading (bowl off the tray, or the scale didn't answer); leaving the meal alone"
             self.store.record_remediation(label, "topup_observe", msg)
             log.info("top-up %s: %s", label, msg)
             return
-        self._stale_food_check(bowl)
+        await self._stale_food_check(grams)
         food, water = sched.amounts(i)
-        decision = topup.plan_topup(food, water, bowl.grams)
-        summary = (f"{bowl.grams:.0f} g in the bowl, meal is {food:g}+{water:g} g -> " +
-                   (f"serve {decision.food_g}+{decision.water_g} g" if decision.action == "topup"
-                    else decision.action))
+        decision = topup.plan_topup(food, water, grams)
+        summary = self._topup_summary(grams, food, water, decision)
         observe = self.p.topup_mode != "on" or self.dry_run or self.p.killswitch.exists()
         self.store.record_remediation(label, "topup_observe" if observe else "topup_decision", summary)
         if decision.action == "full":
@@ -444,7 +470,7 @@ class Monitor:
                    else sched.with_amounts(i, decision.food_g, decision.water_g))
         pending = {"slot_sec": slot_sec, "slot_epoch": slot_epoch, "label": label,
                    "action": decision.action, "orig": [food, water],
-                   "new": [decision.food_g, decision.water_g], "leftover": bowl.grams,
+                   "new": [decision.food_g, decision.water_g], "leftover": grams,
                    "saw_cycle": False}
         self._topup_set_pending(pending)              # saved first: a crash after the write still restores
         try:
@@ -453,15 +479,35 @@ class Monitor:
             self._topup_set_pending(None)
             raise
         log.warning("top-up %s: %s", label, summary)
-        if decision.action == "skip":
-            self.n.fyi(f"{label} meal skipped — bowl still full",
-                       f"{bowl.grams:.0f} g is still in the bowl, as much as the {food + water:g} g "
-                       f"meal, so the {label} meal is skipped for today.")
-        else:
-            self.n.fyi(f"{label} meal topped up",
-                       f"{bowl.grams:.0f} g is still in the bowl, so the {label} meal will be "
-                       f"{decision.food_g} g food + {decision.water_g} g water instead of "
-                       f"{food:g} + {water:g}. The schedule goes back to normal after it is served.")
+        self._topup_notify(label, grams, food, water, decision)
+
+    async def _topup_revise(self, sched: Schedule, pending: dict, grams: float) -> None:
+        """Before prep starts: the cat may have eaten since the decision. Undo it if the
+        bowl is now empty enough for a full meal; change it if it is now a different
+        top-up. A change needs the bowl to have moved by a few grams, so scale noise
+        can't flip a decision back and forth."""
+        orig = pending["orig"]
+        want = topup.plan_topup(*orig, grams)
+        if want.action == "full":
+            await self._topup_restore(sched, pending, f"the bowl now has {grams:.0f} g")
+            return
+        same = want.action == pending["action"] and (want.action == "skip" or [want.food_g, want.water_g] == pending["new"])
+        if same or abs(grams - pending["leftover"]) < 4:
+            return
+        i = sched.index_of(pending["slot_sec"])
+        if i is None:
+            return
+        changed = sched.with_amounts(i, *orig).with_skipped(i, False)
+        changed = (changed.with_skipped(i) if want.action == "skip"
+                   else changed.with_amounts(i, want.food_g, want.water_g))
+        before = self._topup_summary(pending["leftover"], *orig, topup.Plan(pending["action"], *pending["new"]))
+        pending.update(action=want.action, new=[want.food_g, want.water_g], leftover=grams)
+        self._topup_set_pending(pending)
+        await self._write_schedule(changed)
+        label = pending["label"]
+        log.warning("top-up %s: changed (%s) to (%s)", label, before, self._topup_summary(grams, *orig, want))
+        self.store.record_remediation(label, "topup_decision", "revised: " + self._topup_summary(grams, *orig, want))
+        self._topup_notify(label, grams, *orig, want)
 
     async def _topup_follow_up(self, st: RikoStatus, sched: Schedule, pending: dict) -> None:
         now = time.time()
@@ -472,15 +518,11 @@ class Monitor:
                 self._topup_set_pending(pending)
             return                                    # never touch the schedule mid-meal
         if now < slot - self.p.topup_prep_lead_min * 60:
-            # still before the feeder starts preparing: if the bowl has been emptied
-            # since we decided (washed, or the cat finally ate), put the full meal back
-            bowl = await self._bowl()
-            if bowl is None:
+            grams = await self._bowl_now()
+            if grams is None:                         # bowl off (likely swapped) or no reading: serve the meal
+                await self._topup_restore(sched, pending, "no scale reading (bowl off the tray?)")
                 return
-            if topup.handled_since_meal(bowl, st.reported_at("bowlStatus")):
-                await self._topup_restore(sched, pending, "the bowl was taken off or put back")
-            elif topup.plan_topup(*pending["orig"], bowl.grams).action == "full":
-                await self._topup_restore(sched, pending, f"the bowl was emptied ({bowl.grams:.0f} g left)")
+            await self._topup_revise(sched, pending, grams)
             return
         served = pending["saw_cycle"] and now >= slot + 60
         if pending["action"] == "skip":
@@ -491,12 +533,12 @@ class Monitor:
             return                                    # suspended or faulted: wait for it to settle
         await self._topup_restore(sched, pending, "meal served" if pending["saw_cycle"] else "slot has passed")
         if pending["action"] == "skip":
-            bowl = await self._bowl()
-            if bowl is not None and bowl.grams <= topup.EMPTY_G:
+            grams = await self._bowl_now()
+            if grams is not None and grams <= topup.EMPTY_G:
                 self.n.action_needed(
                     f"{label} meal was skipped, but the bowl is empty now",
                     f"The bowl held {pending['leftover']:.0f} g when the {label} meal was skipped and "
-                    f"reads {bowl.grams:.0f} g now. Consider a manual feed.")
+                    f"has {grams:.0f} g now. Consider a manual feed.")
 
     async def _topup_restore(self, sched: Schedule, pending: dict, why: str) -> None:
         label = pending["label"]
@@ -527,8 +569,17 @@ class Monitor:
         self.store.record_remediation(label, "topup", "ok")
         log.info("top-up %s: %s — %s", label, result, why)
 
-    def _stale_food_check(self, bowl: "topup.Bowl") -> None:
-        if bowl.grams <= topup.EMPTY_G:
+    async def _stale_food_check(self, grams: float) -> None:
+        """Alert when food has sat in the bowl for stale_food_hours. "When was the bowl
+        last empty" comes from the ledger; today's weight from the live scale."""
+        if grams <= topup.EMPTY_G:
+            return
+        try:
+            bowl = topup.bowl_now(await self._get_ledger())
+        except Exception as exc:
+            log.info("stale-food check: no ledger: %r", exc)
+            return
+        if bowl is None:
             return
         since = bowl.emptied_at
         hours = None if since is None else (time.time() - since) / 3600
@@ -541,7 +592,7 @@ class Monitor:
         age = "more than 2 days" if hours is None else f"{hours:.0f} hours"
         self.n.action_needed(
             "Food has been sitting in the bowl",
-            f"The bowl has not been empty for {age} and holds {bowl.grams:.0f} g. "
+            f"The bowl has not been empty for {age} and holds {grams:.0f} g. "
             f"The feeder can't clear it — dump and rinse the bowl.")
 
     def _write_status_snapshot(self, raw: dict | None = None, error: str | None = None) -> None:

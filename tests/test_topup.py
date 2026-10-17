@@ -57,12 +57,15 @@ PLAN = {"bEn": [1]*6, "bDayEn": [1]*6, "time": [14100, 28500, 42900, 57300, 7170
         "food": [3, 8, 8, 8, 8, 8], "water": [21, 56, 56, 56, 56, 56], "aud": [2]*6, "type": [1]*6}
 
 class Feeder:                       # the fake Riko: holds the schedule and state
-    scale_at = None                 # when the feeder's scale last reported (bowl handled)
-    def __init__(self): self.plan = json.loads(json.dumps(PLAN)); self.state = 0; self.writes = []
+    scale = "ledger"                # live scale: "ledger" (food = the ledger's bowl), "off" (bowl lifted), "fail"
+    def __init__(self): self.plan = json.loads(json.dumps(PLAN)); self.state = 0; self.writes = []; self.reads = 0
     def status(self):
         raw = {"fdPlanStr": {"value": json.dumps(self.plan)}, "deviceState": {"value": {"state": self.state, "param": 0}}}
-        if self.scale_at: raw["bowlStatus"] = {"time": self.scale_at * 1000, "value": {"bBowlIn": 1, "curWeight": 143, "bowlGram": 68}}
         return RikoStatus(raw)
+    async def live_scale(self):
+        self.reads += 1
+        if self.scale == "fail": raise RuntimeError("iotRead timed out")
+        return (2.0, 68.0) if self.scale == "off" else (self.ledger.bowl + 68.0, 68.0)
     async def set_schedule_raw(self, plan): self.plan = json.loads(json.dumps(plan)); self.writes.append(self.plan)
 
 class Ledger:                       # the bowl holds `bowl` grams; it was last empty `emptied_h` hours ago
@@ -79,7 +82,7 @@ class Ledger:                       # the bowl holds `bowl` grams; it was last e
                 "eat_list": eats}
 
 def make(mode="on", store=None, d=None):
-    d = d or Path(tempfile.mkdtemp()); f, l, notes = Feeder(), Ledger(), []
+    d = d or Path(tempfile.mkdtemp()); f, l, notes = Feeder(), Ledger(), []; f.ledger = l
     n = types.SimpleNamespace(action_needed=lambda t, b: notes.append(("ACT", t)) or True,
                               fyi=lambda t, b: notes.append(("FYI", t)) or True)
     mon = M.Monitor(f, store or M.Store(d / "m.db"), n, M.Policy(killswitch=d / "KILL", topup_mode=mode), 0, False,
@@ -166,20 +169,43 @@ async def main():
 
     # J. outside the decision window, or feeder asleep -> untouched
     reset(); mon, f, l, notes, _ = make(); l.bowl = 66; clock["now"] -= 30 * 60
-    await step(mon, f, 0); assert l.calls == 0
-    reset(); mon, f, l, notes, _ = make(); l.bowl = 66; await step(mon, f, 0, state=5); assert l.calls == 0 and not f.writes
+    await step(mon, f, 0); assert l.calls == 0 and f.reads == 0
+    reset(); mon, f, l, notes, _ = make(); l.bowl = 66; await step(mon, f, 0, state=5); assert f.reads == 0 and not f.writes
     print("J ok: outside the window or feeder asleep -> untouched")
 
-    # K. bowl taken off / put back since the last meal -> ledger not trusted, meal left alone
-    reset(); mon, f, l, notes, _ = make(); l.bowl = 75; f.scale_at = clock["now"] - 3 * 3600
-    await step(mon, f, 0); assert not f.writes and not notes and "handled" in rows(mon)[0][2], rows(mon)
-    reset(); mon, f, l, notes, _ = make(); l.bowl = 66; f.scale_at = clock["now"] - 9 * 3600   # before the last feed
-    await step(mon, f, 0); assert f.plan["bDayEn"][2] == 0
-    # L. bowl swapped after a skip was applied, before prep -> skip undone
+    # K. no live reading (bowl off the tray, or the scale didn't answer) -> meal left alone
+    for how in ("off", "fail"):
+        reset(); mon, f, l, notes, _ = make(); l.bowl = 66; f.scale = how
+        await step(mon, f, 0); assert not f.writes and not notes and "no live reading" in rows(mon)[0][2], rows(mon)
+        await step(mon, f); assert f.reads == 1, "decided once; no retry loop"
+    # L. bowl lifted after a skip was applied, before prep -> skip undone (likely swapped for a clean one)
     reset(); mon, f, l, notes, _ = make(); l.bowl = 66
     await step(mon, f, 0); assert f.plan["bDayEn"][2] == 0
-    f.scale_at = clock["now"] + 20; await step(mon, f, 1)
+    f.scale = "off"; await step(mon, f, 1)
     assert f.plan == PLAN and mon._topup_pending() is None
-    print("K/L ok: a handled bowl leaves the meal alone; a swap after a skip puts the meal back")
+    print("K/L ok: no reading leaves the meal alone; lifting the bowl after a skip puts the meal back")
+
+    # M. 2026-10-17: skipped at 66 g, then he eats before prep -> skip turns into a top-up, then a full meal
+    reset(); mon, f, l, notes, _ = make(); l.bowl = 66
+    await step(mon, f, 0); assert f.plan["bDayEn"][2] == 0
+    l.bowl = 63; await step(mon, f); assert len(f.writes) == 1, "a few grams of noise changes nothing"
+    l.bowl = 20; await step(mon, f)
+    assert f.plan["bDayEn"][2] == 1 and (f.plan["food"][2], f.plan["water"][2]) == (6, 42), f.plan
+    assert mon._topup_pending()["action"] == "topup" and notes[-1] == ("FYI", "11:55 meal topped up"), notes
+    l.bowl = 0; await step(mon, f)
+    assert f.plan == PLAN and mon._topup_pending() is None
+    # ...and the other way: a top-up becomes a skip if food is added (bowl topped up by hand)
+    reset(); mon, f, l, notes, _ = make(); l.bowl = 40
+    await step(mon, f, 0); l.bowl = 70; await step(mon, f)
+    assert f.plan["bDayEn"][2] == 0 and f.plan["food"][2] == 8 and mon._topup_pending()["action"] == "skip", f.plan
+    for _ in range(40): await step(mon, f)
+    assert f.plan["food"][2] == 8 and mon._topup_pending() is None      # skip flag clears itself at midnight
+    print("M ok: decisions follow the scale until prep:", " / ".join(t for _, t in notes))
+
+    # N. after prep starts the decision is final, whatever the scale says
+    reset(); mon, f, l, notes, _ = make(); l.bowl = 40
+    await step(mon, f, 0); clock["now"] += 4 * 60; l.bowl = 0; await step(mon, f, 0.5)
+    assert (f.plan["food"][2], f.plan["water"][2]) == (3, 21), "not after the 10-minute prep cutoff"
+    print("N ok: no changes once the feeder is preparing")
 
 asyncio.run(main())
