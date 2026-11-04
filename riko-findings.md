@@ -142,6 +142,22 @@ and the bowl is ground without being counted, and lands later, dry:
 
 Take the bowl off before resuming or clearing a jam.
 
+### Jams depend on the food
+*(Found 2026-11-04; firmware 1.0.0-0033, then 1.0.1-0007 from 2026-10-28.)* Grinder
+jams (code 13) track the recipe in the hopper much more than anything else. Both are
+Stella & Chewy's freeze-dried Dinner Morsels, on the same schedule of 5–6 g meals:
+
+| Food in the hopper | Days | Jam events | Meals failed by a jam |
+|---|---|---|---|
+| Chicken (10-13 to 10-21) | 9 | 0 | 0 |
+| Duck Duck Goose (10-22 to 11-02) | 11 | 30 (about 2.7 a day) | 13 |
+| Chicken topped onto the last of the duck (from 11-02) | 2 | 4, all before 11-03 08:00 | 0 |
+
+The firmware update on 10-28 did not stop them: the duck kept jamming on 1.0.1-0007,
+mostly at the 17:55 to 00:00 meals. A left-alone jam gives up after 10 minutes and
+serves what it has, on both firmwares. Duck is also richer: about 5.3 kcal/g, against
+4.4–4.6 for chicken.
+
 ### The device leaks its own credentials
 The device-info endpoint the app uses returns the feeder's cloud authentication
 secret — to a *shared* account, not just the owner. That's a security problem
