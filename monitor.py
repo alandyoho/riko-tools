@@ -82,6 +82,9 @@ class Store:
             key TEXT PRIMARY KEY, value TEXT, ts INTEGER)""")
         self.db.execute("""CREATE TABLE IF NOT EXISTS setting_changes(
             ts INTEGER, key TEXT, old TEXT, new TEXT)""")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS jams(
+            start INTEGER, slot TEXT, code INTEGER, end INTEGER, outcome TEXT,
+            bowl_start REAL, bowl_max REAL, bowl_end REAL, samples TEXT)""")
         self.db.commit()
 
     def log_feed(self, state: str, param: int, note: str = "") -> None:
@@ -107,6 +110,19 @@ class Store:
     def record_setting_change(self, key: str, old: str, new: str) -> None:
         self.db.execute("INSERT INTO setting_changes VALUES (?,?,?,?)",
                         (int(time.time()), key, old, new))
+        self.db.commit()
+
+    def jam_start(self, slot: str, code: int, bowl: float | None) -> int:
+        cur = self.db.execute("INSERT INTO jams (start, slot, code, bowl_start, bowl_max, samples) "
+                              "VALUES (?,?,?,?,?,?)", (int(time.time()), slot, code, bowl, bowl, "[]"))
+        self.db.commit()
+        return cur.lastrowid
+
+    def jam_update(self, row: int, samples: list, end: int | None = None, outcome: str | None = None) -> None:
+        grams = [g for _, g in samples if g is not None]
+        self.db.execute("UPDATE jams SET samples=?, bowl_max=?, bowl_end=?, end=?, outcome=? WHERE rowid=?",
+                        (json.dumps(samples), max(grams) if grams else None, grams[-1] if grams else None,
+                         end, outcome, row))
         self.db.commit()
 
     def remediations_today(self, kind: str | None = None) -> int:
@@ -655,14 +671,34 @@ class Monitor:
             self._last_state = cur
 
         if st.state != FeederState.SUSPENDED or st.state_param not in NEVER_RETRY:
-            self._jam = None               # that grinder fault is over
+            if self._jam is not None:      # that grinder fault is over
+                self._end_jam(st)
         if st.state == FeederState.SUSPENDED:
             await self._handle_suspension(st)
         elif st.state == FeederState.FAULT:
             self.n.action_needed("Feeder fault",
                                  f"Device in FAULT (param {st.state_param}). Needs a look.")
 
-    async def _handle_grinder_fault(self, code: int, name: str) -> None:
+    def _end_jam(self, st: RikoStatus) -> None:
+        """Record how a grinder fault ended, for the jam log (table `jams`):
+        PREPARING again = it cleared itself; SERVING = it gave up and served what it had;
+        SUSPENDED with another code (cover off, bowl off) = someone opened it to clear it."""
+        jam, self._jam = self._jam, None
+        if st.state == FeederState.PREPARING:
+            outcome = "cleared itself"
+        elif st.state == FeederState.SERVING:
+            outcome = "gave up, served what it had"
+        elif st.state == FeederState.SUSPENDED:
+            outcome = "then " + ERROR_CODES.get(st.state_param, f"code {st.state_param}")
+        else:
+            outcome = st.state.name.lower()
+        log.info("grinder fault ended after %.0f s: %s", time.time() - jam["start"], outcome)
+        try:
+            self.store.jam_update(jam["row"], jam["samples"], int(time.time()), outcome)
+        except Exception as exc:
+            log.warning("jam log: %r", exc)
+
+    async def _handle_grinder_fault(self, code: int, name: str, slot: str = "adhoc") -> None:
         """Alert once per grinder fault (then every 10 minutes), never retry it, and for
         a jam watch the bowl with the live scale.
 
@@ -681,8 +717,12 @@ class Monitor:
         except Exception as exc:
             log.warning("grinder fault: couldn't read the scale: %r", exc)
         now = time.time()
-        if self._jam is None or self._jam["code"] != code:
-            self._jam = {"code": code, "alerted_at": now, "base": food, "dumped": False}
+        if self._jam is not None and self._jam["code"] != code:
+            self._end_jam(RikoStatus({"deviceState": {"value": {"state": int(FeederState.SUSPENDED), "param": code}}}))
+        if self._jam is None:
+            row = self.store.jam_start(slot, code, None if food is None else round(food, 1))
+            self._jam = {"code": code, "alerted_at": now, "base": food, "dumped": False,
+                         "start": now, "row": row, "samples": [(int(now), None if food is None else round(food, 1))]}
             if code == 13:
                 in_bowl = (f" The bowl holds about {max(0, food):.0f} g right now." if food is not None
                            else " The bowl is off the tray right now.")
@@ -696,6 +736,11 @@ class Monitor:
                                      "Mechanical fault — not auto-retrying. Please check the grinder.")
             return
         jam = self._jam
+        jam["samples"].append((int(now), None if food is None else round(food, 1)))
+        try:
+            self.store.jam_update(jam["row"], jam["samples"])
+        except Exception as exc:
+            log.warning("jam log: %r", exc)
         if food is not None and jam["base"] is None:
             jam["base"] = food                     # the bowl is back on; measure from here
         if (food is not None and jam["base"] is not None and not jam["dumped"]
@@ -768,7 +813,7 @@ class Monitor:
         slot = _current_slot_label(st, self.tz_offset)
 
         if code in NEVER_RETRY:
-            await self._handle_grinder_fault(code, name)
+            await self._handle_grinder_fault(code, name, slot)
             return
         if code == BOWL_MISSING:
             await self._handle_bowl_missing_suspension(st, name, slot)

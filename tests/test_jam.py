@@ -69,4 +69,20 @@ async def main():
     await poll(mon, f, 0); await poll(mon, f)
     assert len(notes) == 1 and notes[0][0] == "Feeder stuck: grinder head missing" and "bowl" not in notes[0][1]
     print("5/6 ok: alert survives a failed scale read; grinder-head-missing keeps the plain message")
+
+    # 7. the jam log: one row per episode, bowl samples while stuck, and how it ended
+    jams = lambda mon: mon.store.db.execute(
+        "select slot, code, end - start, outcome, bowl_start, bowl_max, bowl_end, samples from jams order by rowid").fetchall()
+    mon, f, notes = make(); f.gram = 95.0
+    await poll(mon, f, 0); await poll(mon, f); await poll(mon, f, gram=97.0)
+    r = jams(mon)[0]; assert r[3] is None and r[5] == 29.0 and len(json.loads(r[7])) == 3, r       # open, still stuck
+    await poll(mon, f, state=1, param=0)                                    # back to preparing
+    await poll(mon, f, state=3, param=13); await poll(mon, f, 600, state=2, param=2)   # gives up, serves
+    await poll(mon, f, state=0, param=0)
+    await poll(mon, f, state=3, param=13, gram=90.0); await poll(mon, f, state=3, param=12)   # lid opened
+    rows = jams(mon)
+    assert [x[3] for x in rows] == ["cleared itself", "gave up, served what it had", "then cover missing"], rows
+    assert len(rows[0][0]) == 5 and rows[0][1] == 13 and rows[0][2] == 90 and (rows[0][4], rows[0][6]) == (27.0, 29.0), rows[0]
+    assert rows[1][2] == 600, rows[1]
+    print("7 ok: jam log ->", [(x[2], x[3]) for x in rows])
 asyncio.run(main())
