@@ -259,6 +259,7 @@ class Monitor:
         self._clock_stuck_alerted = False
         self._clock_held_for: str | None = None
         self._jam: dict | None = None      # the grinder fault in progress, if any
+        self._sleep = asyncio.sleep        # replaced in tests
         self._in_pass = False              # inside check(): the ledger is fetched at most once
         self._pass_ledger: dict | None = None
         self._pass_ledger_failed = False
@@ -679,6 +680,109 @@ class Monitor:
             self.n.action_needed("Feeder fault",
                                  f"Device in FAULT (param {st.state_param}). Needs a look.")
 
+    async def _jam_experiment(self, slot: str) -> None:
+        """One-time test of software unjamming, armed by the setting jam_experiment=armed.
+
+        The feeder never clears a jam by itself, and foodProvide does nothing while it
+        is idle (Test A, 2026-11-04). This tries, once, on a real jam, with the tray in
+        and the meal suspended:
+          1. pause, wait 20 s, resume (the app's resume alone failed on 10-12)
+          2. a 2-second foodProvide pulse, then resume
+        After each it watches for 60 s. It stops at the first step that gets the meal
+        moving, and stops early if someone starts clearing it by hand (hopper out) or
+        food drops into the bowl. Never sends END: that serves whatever is ground.
+        Disarms itself before the first command, so a crash can't repeat it.
+        """
+        if self.dry_run or self.p.killswitch.exists():
+            log.info("jam experiment armed but held off (dry run or kill switch)")
+            return
+        jam = self._jam
+        self.store.put_setting("jam_experiment", "ran " + time.strftime("%Y-%m-%d %H:%M"))
+        steps: list[dict] = []
+
+        async def look(label: str) -> RikoStatus:
+            st = await self.r.status()
+            food = None
+            try:
+                gram, bowl = await self.r.live_scale()
+                food = round(gram - bowl, 1) if gram > bowl / 2 else None
+            except Exception:
+                pass
+            steps.append({"t": int(time.time()), "step": label, "state": f"{st.state.name}/{st.state_param}",
+                          "bowl": food})
+            log.warning("jam experiment: %s -> %s, bowl %s g", label, steps[-1]["state"], food)
+            return st
+
+        def stop_reason(st: RikoStatus) -> str | None:
+            cover = st.reported_at("bCoverAbsent")
+            if cover is not None and cover >= jam["start"] - 5:
+                return "the hopper was taken out (cleared by hand)"
+            grams = [x["bowl"] for x in steps if x.get("bowl") is not None]
+            if len(grams) >= 2 and grams[-1] - grams[0] >= self.p.overdispense_alert_g:
+                return f"{grams[-1] - grams[0]:.0f} g dropped into the bowl"
+            return None
+
+        async def watch(label: str) -> str | None:
+            for i in range(6):
+                await self._sleep(10)
+                st = await look(f"{label} +{10 * (i + 1)}s")
+                if st.state in (FeederState.PREPARING, FeederState.SERVING, FeederState.IDLE):
+                    return "moving"
+                if stop_reason(st):
+                    return "stop"
+            return None
+
+        self.n.action_needed(
+            "Trying an automatic unjam (one-time test)",
+            "Over the next ~3 minutes the monitor will try pause + resume, then a short grinder "
+            "pulse + resume. If you can, leave it alone until you get the result, so the test is "
+            "clean. You'll be alerted if food drops into the bowl.")
+        result = "neither step cleared the jam"
+        try:
+            st = await look("start")
+            why = stop_reason(st)
+            for label in ("pause + resume", "grinder pulse + resume"):
+                if why:
+                    break
+                try:
+                    if label == "pause + resume":
+                        try:
+                            await self.r.feed_control(FeedCtrl.PAUSE)
+                        except Exception as exc:   # refused while suspended: still try the resume
+                            steps.append({"t": int(time.time()), "step": "pause refused", "error": repr(exc)})
+                        await self._sleep(20)
+                        await look("paused 20s")
+                    else:
+                        try:
+                            await self.r.dispense_food(True)
+                            await self._sleep(2)
+                        finally:
+                            await self.r.dispense_food(False)
+                        await self._sleep(5)
+                        await look("after grinder pulse")
+                    await self.r.feed_control(FeedCtrl.RESUME)
+                except Exception as exc:
+                    steps.append({"t": int(time.time()), "step": f"{label} failed", "error": repr(exc)})
+                    log.warning("jam experiment: %s failed: %r", label, exc)
+                    continue
+                outcome = await watch(label)
+                if outcome == "moving":
+                    result = f"{label} got the meal going again ({steps[-1]['state']})"
+                    break
+                if outcome == "stop":
+                    why = stop_reason(await look("check"))
+            if why:
+                result = "stopped: " + why
+        except Exception as exc:
+            result = f"failed: {exc!r}"
+        log.warning("jam experiment %s: %s", slot, result)
+        self.store.record_remediation(slot, "jam_experiment", result + " | " + json.dumps(steps))
+        self.store.put_setting("jam_experiment", "ran " + time.strftime("%Y-%m-%d %H:%M") + ": " + result)
+        grams = [x["bowl"] for x in steps if x.get("bowl") is not None]
+        moved = f" The bowl went from {grams[0]:.0f} g to {grams[-1]:.0f} g." if len(grams) >= 2 else ""
+        self.n.action_needed("Unjam test: " + result.split(" (")[0],
+                             f"Result: {result}.{moved} The test is now disarmed.")
+
     def _end_jam(self, st: RikoStatus) -> None:
         """Record how a grinder fault ended, for the jam log (table `jams`).
 
@@ -740,6 +844,8 @@ class Monitor:
             else:
                 self.n.action_needed(f"Feeder stuck: {name}",
                                      "Mechanical fault — not auto-retrying. Please check the grinder.")
+            if code == 13 and self.store.get_setting("jam_experiment") == "armed":
+                await self._jam_experiment(slot)
             return
         jam = self._jam
         jam["samples"].append((int(now), None if food is None else round(food, 1)))

@@ -7,6 +7,24 @@ deleting them, so we don't re-run tests we've already done.
 
 ## High value
 
+### Can software clear a grinder jam? (armed, runs on the next jam)
+The feeder never clears a jam itself: of 30 from 10-20 to 11-03, 18 were cleared by
+hand (hopper out, stuck food removed, hopper back) and 12 timed out at 10 minutes and
+served a partial meal — so a jam with nobody home costs most of that meal.
+
+- **Test A, 2026-11-04 18:01 — answered: no while idle.** `foodProvide` on for 2 s with
+  the tray out, then 2 s and 5 s with the tray retracted (which put the feeder in
+  freshness protection, as in September): every call accepted, no sound from the
+  grinder, the scale moved less than 0.1 g. Extending the tray put it back to idle.
+- **Test B, armed 2026-11-04:** the monitor's one-time jam experiment
+  (`_jam_experiment`, setting `jam_experiment=armed` in monitor.db). On the next jam it
+  alerts, then tries pause → 20 s → resume, then a 2 s `foodProvide` pulse → resume,
+  watching state and scale for 60 s after each. It stops at the first success, if the
+  hopper is taken out, or if 8 g drops into the bowl, and never sends END. The result
+  goes to an alert, the `remediations` table (kind `jam_experiment`) and the setting.
+- **Why it matters:** if either works, the monitor can unjam automatically (once per
+  meal) instead of losing the meal when nobody is home.
+
 ### Does the feeder work on battery, with no mains power?
 The schedule (`fdPlanStr`) and the clock live on the device, and there's a battery
 (90%, `pwrType: 0` = on DC), a `battSavingMode` property, and battery-low/critical

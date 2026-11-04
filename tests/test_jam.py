@@ -89,4 +89,66 @@ async def main():
     assert len(rows[0][0]) == 5 and rows[0][1] == 13 and rows[0][2] == 90 and (rows[0][4], rows[0][6]) == (27.0, 29.0), rows[0]
     assert rows[1][2] == 600, rows[1]
     print("7 ok: jam log ->", [(x[2], x[3]) for x in rows])
+
+    # 8. the one-time unjam experiment
+    def exp(arm=True, kill=False):
+        mon, f, notes = make(); f.gram = 95.0; f.cmds = []
+        if arm: mon.store.put_setting("jam_experiment", "armed")
+        if kill:
+            k = Path(tempfile.mkdtemp()) / "KILL"; k.touch(); mon.p.killswitch = k
+        async def feed_control(a): f.cmds.append(("ctrl", int(a))); f.on_cmd(("ctrl", int(a)))
+        async def dispense_food(on): f.cmds.append(("grind", on)); f.on_cmd(("grind", on))
+        async def sleep(s): clock["now"] += s
+        f.feed_control, f.dispense_food, f.on_cmd, mon._sleep = feed_control, dispense_food, (lambda c: None), sleep
+        plain = f.status
+        f.status = lambda: Awaitable(plain().raw)     # the monitor awaits status() during the test
+        return mon, f, notes
+    class Awaitable(RikoStatus):
+        def __await__(self):
+            return self
+            yield
+    setting = lambda mon: mon.store.get_setting("jam_experiment")
+    # not armed / kill switch -> no commands
+    for arm, kill in ((False, False), (True, True)):
+        mon, f, notes = exp(arm, kill); await poll(mon, f, 0)
+        assert f.cmds == [] and len(notes) == 1, (arm, kill, f.cmds, notes)
+    assert setting(mon) == "armed", "the kill switch keeps it armed for next time"
+    # pause + resume works -> stops there, disarmed, result alert
+    mon, f, notes = exp()
+    def on(c):
+        if c == ("ctrl", 1): f.state, f.param = 1, 0
+    f.on_cmd = on; await poll(mon, f, 0)
+    assert f.cmds == [("ctrl", 0), ("ctrl", 1)], f.cmds
+    assert setting(mon).startswith("ran ") and "pause + resume got the meal going" in setting(mon), setting(mon)
+    assert [t for t, _ in notes] == ["Feeder stuck: grinder jammed with food", "Trying an automatic unjam (one-time test)",
+                                     "Unjam test: pause + resume got the meal going again"], notes
+    await poll(mon, f); assert mon._jam is None
+    # nothing works -> both steps, grinder always switched off, then disarmed; a second jam does nothing
+    mon, f, notes = exp(); await poll(mon, f, 0)
+    assert f.cmds == [("ctrl", 0), ("ctrl", 1), ("grind", True), ("grind", False), ("ctrl", 1)], f.cmds
+    assert notes[-1][0] == "Unjam test: neither step cleared the jam", notes[-1]
+    await poll(mon, f, state=0, param=0); n = len(f.cmds); await poll(mon, f, state=3, param=13)
+    assert len(f.cmds) == n, "runs once"
+    # pause refused while suspended -> the resume is still tried
+    mon, f, notes = exp()
+    async def refuse(a):
+        f.cmds.append(("ctrl", int(a)))
+        if int(a) == 0: raise RuntimeError("not allowed")
+    f.feed_control = refuse; await poll(mon, f, 0)
+    res = mon.store.db.execute("select result from remediations where kind='jam_experiment'").fetchone()[0]
+    assert f.cmds[:2] == [("ctrl", 0), ("ctrl", 1)] and "pause refused" in res and not res.startswith("failed"), res
+    # someone starts clearing it by hand mid-test -> stops, no more commands
+    mon, f, notes = exp()
+    def hand(c):
+        if c == ("ctrl", 1): f.cover_at = clock["now"]
+    f.on_cmd = hand; await poll(mon, f, 0)
+    assert f.cmds == [("ctrl", 0), ("ctrl", 1)] and "hopper was taken out" in notes[-1][1], (f.cmds, notes[-1])
+    # food drops into the bowl after the resume -> stops, the result says so
+    mon, f, notes = exp()
+    def dump(c):
+        if c == ("ctrl", 1): f.gram = 140.0
+    f.on_cmd = dump; await poll(mon, f, 0)
+    assert f.cmds == [("ctrl", 0), ("ctrl", 1)] and "45 g dropped into the bowl" in notes[-1][1], (f.cmds, notes[-1])
+    print("8 ok: unjam experiment -> once, armed only, stops on success / hand-clear / dump; results:",
+          [r[0][:60] for r in mon.store.db.execute("select result from remediations where kind='jam_experiment'")])
 asyncio.run(main())
