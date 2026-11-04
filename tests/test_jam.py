@@ -15,9 +15,12 @@ PLAN = {"bEn": [1]*6, "bDayEn": [1]*6, "time": [14100, 28500, 42900, 57300, 7170
         "food": [3, 8, 8, 8, 8, 8], "water": [21, 56, 56, 56, 56, 56], "aud": [2]*6, "type": [1]*6}
 class Feeder:
     def __init__(self): self.state, self.param, self.gram, self.fail, self.reads = 3, 13, 95.0, False, 0
+    cover_at = None                 # when the feeder last reported the hopper/lid taken out or put back
     def status(self):
-        return RikoStatus({"fdPlanStr": {"value": json.dumps(PLAN)},
-                           "deviceState": {"value": {"state": self.state, "param": self.param}}})
+        raw = {"fdPlanStr": {"value": json.dumps(PLAN)},
+               "deviceState": {"value": {"state": self.state, "param": self.param}}}
+        if self.cover_at: raw["bCoverAbsent"] = {"time": self.cover_at * 1000, "value": 1}
+        return RikoStatus(raw)
     async def live_scale(self):
         self.reads += 1
         if self.fail: raise TimeoutError()
@@ -76,12 +79,13 @@ async def main():
     mon, f, notes = make(); f.gram = 95.0
     await poll(mon, f, 0); await poll(mon, f); await poll(mon, f, gram=97.0)
     r = jams(mon)[0]; assert r[3] is None and r[5] == 29.0 and len(json.loads(r[7])) == 3, r       # open, still stuck
-    await poll(mon, f, state=1, param=0)                                    # back to preparing
-    await poll(mon, f, state=3, param=13); await poll(mon, f, 600, state=2, param=2)   # gives up, serves
+    f.cover_at = clock["now"] + 10; await poll(mon, f, state=1, param=0)  # hopper out and back, then preparing
+    await poll(mon, f, state=3, param=13); await poll(mon, f, 600, state=2, param=2)   # nobody came: times out
     await poll(mon, f, state=0, param=0)
     await poll(mon, f, state=3, param=13, gram=90.0); await poll(mon, f, state=3, param=12)   # lid opened
     rows = jams(mon)
-    assert [x[3] for x in rows] == ["cleared itself", "gave up, served what it had", "then cover missing"], rows
+    assert [x[3] for x in rows] == ["cleared by hand (hopper out and back)", "gave up, served what it had",
+                                    "then cover missing"], rows
     assert len(rows[0][0]) == 5 and rows[0][1] == 13 and rows[0][2] == 90 and (rows[0][4], rows[0][6]) == (27.0, 29.0), rows[0]
     assert rows[1][2] == 600, rows[1]
     print("7 ok: jam log ->", [(x[2], x[3]) for x in rows])

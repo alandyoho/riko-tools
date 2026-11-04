@@ -680,14 +680,20 @@ class Monitor:
                                  f"Device in FAULT (param {st.state_param}). Needs a look.")
 
     def _end_jam(self, st: RikoStatus) -> None:
-        """Record how a grinder fault ended, for the jam log (table `jams`):
-        PREPARING again = it cleared itself; SERVING = it gave up and served what it had;
-        SUSPENDED with another code (cover off, bowl off) = someone opened it to clear it."""
+        """Record how a grinder fault ended, for the jam log (table `jams`).
+
+        The feeder has never cleared a jam by itself: of 30 from 10-20 to 11-03, 18 were
+        cleared by hand (hopper out, stuck food removed, hopper back) and 12 timed out at
+        10 minutes and served what they had. Taking the hopper out doesn't change the
+        state — it stays jammed until the hopper is back — so a hand-clear shows up as
+        bCoverAbsent being reported after the jam began."""
         jam, self._jam = self._jam, None
+        cover = st.reported_at("bCoverAbsent")
+        handled = cover is not None and cover >= jam["start"] - 5
         if st.state == FeederState.PREPARING:
-            outcome = "cleared itself"
+            outcome = "cleared by hand (hopper out and back)" if handled else "cleared, no hopper removal seen"
         elif st.state == FeederState.SERVING:
-            outcome = "gave up, served what it had"
+            outcome = "gave up, served what it had" + (" (hopper was taken out)" if handled else "")
         elif st.state == FeederState.SUSPENDED:
             outcome = "then " + ERROR_CODES.get(st.state_param, f"code {st.state_param}")
         else:

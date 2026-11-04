@@ -154,8 +154,13 @@ Stella & Chewy's freeze-dried Dinner Morsels, on the same schedule of 5–6 g me
 | Chicken topped onto the last of the duck (from 11-02) | 2 | 4, all before 11-03 08:00 | 0 |
 
 The firmware update on 10-28 did not stop them: the duck kept jamming on 1.0.1-0007,
-mostly at the 17:55 to 00:00 meals. A left-alone jam gives up after 10 minutes and
-serves what it has, on both firmwares. Duck is also richer: about 5.3 kcal/g, against
+mostly at the 17:55 to 00:00 meals.
+
+**The feeder never clears a jam by itself.** Of 30 jams from 10-20 to 11-03, 18 were
+cleared by hand (hopper out, stuck food removed, hopper back: the meal resumes 10–45 s
+after the hopper goes back in) and 12 timed out at exactly 10 minutes and served what
+they had, mostly at night. The state stays "jammed" while the hopper is out; the only
+sign of it is the `bCoverAbsent` property and a "CoverLost" event. Duck is also richer: about 5.3 kcal/g, against
 4.4–4.6 for chicken.
 
 ### The device leaks its own credentials
