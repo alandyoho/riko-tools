@@ -27,8 +27,8 @@ class Feeder:
         return self.gram, 68
 def make():
     f, notes = Feeder(), []
-    n = types.SimpleNamespace(action_needed=lambda t, b: notes.append((t, b)) or True, fyi=lambda t, b: True)
-    mon = M.Monitor(f, M.Store(Path(tempfile.mkdtemp()) / "m.db"), n, M.Policy(killswitch=Path("/nonexistent")), 0, False)
+    n = types.SimpleNamespace(action_needed=lambda t, b: notes.append((t, b)) or True, fyi=lambda t, b: notes.append((t, b)) or True)
+    mon = M.Monitor(f, M.Store(Path(tempfile.mkdtemp()) / "m.db"), n, M.Policy(killswitch=Path("/nonexistent"), auto_unjam=False), 0, False)
     return mon, f, notes
 async def poll(mon, f, secs=30, **changes):
     clock["now"] += secs
@@ -90,65 +90,68 @@ async def main():
     assert rows[1][2] == 600, rows[1]
     print("7 ok: jam log ->", [(x[2], x[3]) for x in rows])
 
-    # 8. the one-time unjam experiment
-    def exp(arm=True, kill=False):
-        mon, f, notes = make(); f.gram = 95.0; f.cmds = []
-        if arm: mon.store.put_setting("jam_experiment", "armed")
-        if kill:
-            k = Path(tempfile.mkdtemp()) / "KILL"; k.touch(); mon.p.killswitch = k
-        async def feed_control(a): f.cmds.append(("ctrl", int(a))); f.on_cmd(("ctrl", int(a)))
-        async def dispense_food(on): f.cmds.append(("grind", on)); f.on_cmd(("grind", on))
-        async def sleep(s): clock["now"] += s
-        f.feed_control, f.dispense_food, f.on_cmd, mon._sleep = feed_control, dispense_food, (lambda c: None), sleep
-        plain = f.status
-        f.status = lambda: Awaitable(plain().raw)     # the monitor awaits status() during the test
-        return mon, f, notes
+    # 8. automatic unjam: pause, 20 s, resume; up to two tries per meal
     class Awaitable(RikoStatus):
         def __await__(self):
             return self
             yield
-    setting = lambda mon: mon.store.get_setting("jam_experiment")
-    # not armed / kill switch -> no commands
-    for arm, kill in ((False, False), (True, True)):
-        mon, f, notes = exp(arm, kill); await poll(mon, f, 0)
-        assert f.cmds == [] and len(notes) == 1, (arm, kill, f.cmds, notes)
-    assert setting(mon) == "armed", "the kill switch keeps it armed for next time"
-    # pause + resume works -> stops there, disarmed, result alert
-    mon, f, notes = exp()
-    def on(c):
-        if c == ("ctrl", 1): f.state, f.param = 1, 0
-    f.on_cmd = on; await poll(mon, f, 0)
-    assert f.cmds == [("ctrl", 0), ("ctrl", 1)], f.cmds
-    assert setting(mon).startswith("ran ") and "pause + resume got the meal going" in setting(mon), setting(mon)
-    assert [t for t, _ in notes] == ["Feeder stuck: grinder jammed with food", "Trying an automatic unjam (one-time test)",
-                                     "Unjam test: pause + resume got the meal going again"], notes
-    await poll(mon, f); assert mon._jam is None
-    # nothing works -> both steps, grinder always switched off, then disarmed; a second jam does nothing
-    mon, f, notes = exp(); await poll(mon, f, 0)
-    assert f.cmds == [("ctrl", 0), ("ctrl", 1), ("grind", True), ("grind", False), ("ctrl", 1)], f.cmds
-    assert notes[-1][0] == "Unjam test: neither step cleared the jam", notes[-1]
-    await poll(mon, f, state=0, param=0); n = len(f.cmds); await poll(mon, f, state=3, param=13)
-    assert len(f.cmds) == n, "runs once"
-    # pause refused while suspended -> the resume is still tried
-    mon, f, notes = exp()
+    def auto(kill=False, policy_off=False):
+        mon, f, notes = make(); f.gram = 95.0; f.cmds = []; mon.p.auto_unjam = True
+        if kill:
+            k = Path(tempfile.mkdtemp()) / "KILL"; k.touch(); mon.p.killswitch = k
+        if policy_off: mon.p.auto_unjam = False
+        async def feed_control(a): f.cmds.append(int(a)); f.on_cmd(int(a))
+        async def sleep(s): clock["now"] += s
+        f.feed_control, f.on_cmd, mon._sleep = feed_control, (lambda c: None), sleep
+        plain = f.status
+        f.status = lambda: Awaitable(plain().raw)
+        return mon, f, notes
+    titles = lambda notes: [t for t, _ in notes]
+    tries = lambda mon: [r[0] for r in mon.store.db.execute("select result from remediations where kind='unjam_result'")]
+    # clears on the first try -> two low-key notes, no urgent alert; the jam log says who cleared it
+    mon, f, notes = auto()
+    def clear(c):
+        if c == 1: f.state, f.param = 1, 0
+    f.on_cmd = clear; await poll(mon, f, 0)
+    assert f.cmds == [0, 1], f.cmds
+    assert titles(notes) == ["Grinder jammed at the 03:55 meal", "Jam cleared at the 03:55 meal"], notes
+    await poll(mon, f)
+    assert mon.store.db.execute("select outcome from jams").fetchone()[0] == "cleared by pause + resume (monitor)"
+    # never clears -> two tries, then the urgent alert with the take-the-bowl-off advice
+    mon, f, notes = auto(); await poll(mon, f, 0)
+    assert f.cmds == [0, 1, 0, 1], f.cmds
+    assert titles(notes) == ["Grinder jammed at the 03:55 meal", "Feeder stuck: grinder jammed with food"], notes
+    assert "tried 2 times, still jammed" in notes[-1][1] and "Take the bowl off" in notes[-1][1], notes[-1][1]
+    # a second jam at the same meal: no tries left -> straight to the urgent alert
+    await poll(mon, f, state=1, param=0); await poll(mon, f, state=3, param=13)
+    assert f.cmds == [0, 1, 0, 1] and "already tried twice" in notes[-1][1], (f.cmds, notes[-1])
+    # pause refused -> the resume is still sent
+    mon, f, notes = auto()
     async def refuse(a):
-        f.cmds.append(("ctrl", int(a)))
+        f.cmds.append(int(a))
         if int(a) == 0: raise RuntimeError("not allowed")
+        clear(int(a))
     f.feed_control = refuse; await poll(mon, f, 0)
-    res = mon.store.db.execute("select result from remediations where kind='jam_experiment'").fetchone()[0]
-    assert f.cmds[:2] == [("ctrl", 0), ("ctrl", 1)] and "pause refused" in res and not res.startswith("failed"), res
-    # someone starts clearing it by hand mid-test -> stops, no more commands
-    mon, f, notes = exp()
+    assert f.cmds == [0, 1] and titles(notes)[-1] == "Jam cleared at the 03:55 meal" and "pause refused" in tries(mon)[0]
+    # hopper taken out during the first try -> stops, no second try
+    mon, f, notes = auto()
     def hand(c):
-        if c == ("ctrl", 1): f.cover_at = clock["now"]
+        if c == 1: f.cover_at = clock["now"]
     f.on_cmd = hand; await poll(mon, f, 0)
-    assert f.cmds == [("ctrl", 0), ("ctrl", 1)] and "hopper was taken out" in notes[-1][1], (f.cmds, notes[-1])
-    # food drops into the bowl after the resume -> stops, the result says so
-    mon, f, notes = exp()
+    assert f.cmds == [0, 1] and "the hopper was taken out" in notes[-1][1], (f.cmds, notes[-1])
+    # food drops into the bowl after the resume -> stops and says so
+    mon, f, notes = auto()
     def dump(c):
-        if c == ("ctrl", 1): f.gram = 140.0
+        if c == 1: f.gram = 140.0
     f.on_cmd = dump; await poll(mon, f, 0)
-    assert f.cmds == [("ctrl", 0), ("ctrl", 1)] and "45 g dropped into the bowl" in notes[-1][1], (f.cmds, notes[-1])
-    print("8 ok: unjam experiment -> once, armed only, stops on success / hand-clear / dump; results:",
-          [r[0][:60] for r in mon.store.db.execute("select result from remediations where kind='jam_experiment'")])
+    assert f.cmds == [0, 1] and "45 g dropped into the bowl" in notes[-1][1], (f.cmds, notes[-1])
+    # kill switch / policy off / bowl off the tray -> no commands, the urgent alert says why
+    for kw, why in (({"kill": True}, "automatic unjam is off"), ({"policy_off": True}, "automatic unjam is off"),
+                    ({}, "the bowl is off the tray")):
+        mon, f, notes = auto(**kw)
+        if not kw: f.gram = 2.0
+        await poll(mon, f, 0)
+        assert f.cmds == [] and titles(notes) == ["Feeder stuck: grinder jammed with food"] and why in notes[0][1], (kw, notes)
+    print("8 ok: auto-unjam -> clears / two tries then alert / per-meal cap / pause refused / hand-clear / dump / off")
+
 asyncio.run(main())

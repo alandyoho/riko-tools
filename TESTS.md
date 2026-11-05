@@ -16,14 +16,16 @@ served a partial meal — so a jam with nobody home costs most of that meal.
   the tray out, then 2 s and 5 s with the tray retracted (which put the feeder in
   freshness protection, as in September): every call accepted, no sound from the
   grinder, the scale moved less than 0.1 g. Extending the tray put it back to idle.
-- **Test B, armed 2026-11-04:** the monitor's one-time jam experiment
-  (`_jam_experiment`, setting `jam_experiment=armed` in monitor.db). On the next jam it
-  alerts, then tries pause → 20 s → resume, then a 2 s `foodProvide` pulse → resume,
-  watching state and scale for 60 s after each. It stops at the first success, if the
-  hopper is taken out, or if 8 g drops into the bowl, and never sends END. The result
-  goes to an alert, the `remediations` table (kind `jam_experiment`) and the setting.
-- **Why it matters:** if either works, the monitor can unjam automatically (once per
-  meal) instead of losing the meal when nobody is home.
+- **Test B, 2026-11-05 07:50 — pause + resume worked once.** A one-time experiment in
+  the monitor ran on a real jam at the 07:55 meal (bowl 43.7 g, most of the meal already
+  in): pause, 20 s, still jammed; resume at 07:50:45, preparing again at 07:50:46. No
+  hopper removal was reported. The meal was served on time in full (6 + 41 g, bowl 51 g,
+  the usual 2–3 g over), so nothing extra dropped. The grinder-pulse step never ran.
+- **Now permanent:** `_auto_unjam` does pause → 20 s → resume on every code 13, up to
+  two tries per meal, and stops if the hopper is taken out or food drops in. **Still
+  open:** how often it works. A plain resume from the app didn't clear the 10-12 jam.
+  Read the `jams` table (outcome "cleared by pause + resume (monitor)" vs the rest) and
+  `remediations` kind `unjam_result` after a few more jams.
 
 ### Does the feeder work on battery, with no mains power?
 The schedule (`fdPlanStr`) and the clock live on the device, and there's a battery

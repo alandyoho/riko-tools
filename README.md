@@ -290,12 +290,21 @@ grinder jam.
   left before, plus what the feeder says it served) and notifies you if the bowl is 8 g
   or more over. It stays quiet if the bowl was handled before the meal, because the
   "left before" figure can't be trusted then.
-- **When the grinder jams** you get one notification (not one every 30 seconds) with the
-  bowl's current weight and this advice: **take the bowl off before you resume or clear
-  the jam.** Food that built up behind it can drop all at once. While the feeder is
-  stuck the monitor keeps weighing the bowl and tells you if food drops in.
+- **When the grinder jams** (code 13) the monitor first tries to clear it: pause, wait
+  20 seconds, resume, then watch for a minute. Up to two tries per meal. You get a
+  low-priority note that it's trying, and another if it worked. The feeder never clears
+  a jam by itself — without help it gives up after 10 minutes and serves a partial
+  meal — and on 2026-11-05 a pause + resume cleared one in a second and the meal was
+  served in full.
+- **If that doesn't work** (or the kill switch is on, or the bowl is off the tray) you
+  get one urgent notification with the bowl's current weight and this advice: **take
+  the bowl off before you clear the jam.** Food that built up behind it can drop all at
+  once. While the feeder is stuck the monitor keeps weighing the bowl and tells you if
+  food drops in. It stops trying the moment the hopper is taken out or food drops in.
 
-It never retries a grinder fault by itself.
+Every jam is logged (table `jams` in `monitor.db`): the bowl's weight while stuck and
+how it ended — cleared by the monitor, cleared by hand, or timed out. Other grinder
+faults (head missing, motor stalled) are never retried.
 
 ### Keep the feeder's clock right
 

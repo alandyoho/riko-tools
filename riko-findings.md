@@ -160,7 +160,12 @@ mostly at the 17:55 to 00:00 meals.
 cleared by hand (hopper out, stuck food removed, hopper back: the meal resumes 10–45 s
 after the hopper goes back in) and 12 timed out at exactly 10 minutes and served what
 they had, mostly at night. The state stays "jammed" while the hopper is out; the only
-sign of it is the `bCoverAbsent` property and a "CoverLost" event. Duck is also richer: about 5.3 kcal/g, against
+sign of it is the `bCoverAbsent` property and a "CoverLost" event.
+
+**But software can clear one.** On 2026-11-05 at 07:50 a pause, 20 seconds, then resume
+sent through the API got a jammed meal preparing again one second after the resume, and
+it was served in full on time. One success so far; a plain resume from the app did not
+clear the 10-12 jam. `foodProvide` (direct grinder) does nothing outside a meal. Duck is also richer: about 5.3 kcal/g, against
 4.4–4.6 for chicken.
 
 ### The device leaks its own credentials
