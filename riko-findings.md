@@ -162,10 +162,21 @@ after the hopper goes back in) and 12 timed out at exactly 10 minutes and served
 they had, mostly at night. The state stays "jammed" while the hopper is out; the only
 sign of it is the `bCoverAbsent` property and a "CoverLost" event.
 
-**But software can clear one.** On 2026-11-05 at 07:50 a pause, 20 seconds, then resume
-sent through the API got a jammed meal preparing again one second after the resume, and
-it was served in full on time. One success so far; a plain resume from the app did not
-clear the 10-12 jam. `foodProvide` (direct grinder) does nothing outside a meal. Duck is also richer: about 5.3 kcal/g, against
+**Software can't clear one either.** On 2026-11-05 at 07:50 a pause, 20 seconds,
+then resume got a jammed meal preparing again a second later and it was served in full,
+but most of that meal's food was already in: only water was left. On a real food jam
+later that day, pause + resume went 0 for 10. Each time the feeder went back to
+preparing, re-declared the jam about 90 s later, and the bowl stayed flat (10.9–11.2 g);
+each resume also restarted its 10-minute give-up timer. A plain resume from the app
+didn't clear the 10-12 jam, and `foodProvide` (direct grinder) does nothing outside a
+meal. Only a hand-clear works.
+
+**A jam can leave a meal short on water.** The feeder serves when its soak timer runs
+out, wherever it is in the meal. The 09:55 meal on 11-05 was held 35 minutes by a jam;
+after the hand-clear it put in the last food and two more water doses and served 7 s
+after the last one: 5 g + 21 g instead of 5 + 35.
+
+Duck is also richer: about 5.3 kcal/g, against
 4.4–4.6 for chicken.
 
 ### The device leaks its own credentials

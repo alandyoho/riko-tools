@@ -55,8 +55,12 @@ async def main():
     for _ in range(14): await poll(mon, f)
     assert [t for t, _ in notes][2:] == ["Feeder still stuck: grinder jammed with food"], [t for t, _ in notes]
     await poll(mon, f, state=0, param=0); assert mon._jam is None and len(notes) == 3
-    await poll(mon, f, state=3, param=13, gram=70.0); assert len(notes) == 4 and "about 2 g right now" in notes[3][1]
-    print("3 ok: reminder after 10 min; a new jam alerts again")
+    await poll(mon, f, state=3, param=13, gram=70.0); assert len(notes) == 3, "same meal: one alert per jammed meal"
+    assert mon.store.db.execute("select count(*) from jams").fetchone()[0] == 2, "but both are logged"
+    mon.store.put_setting("jam_alerted", "")                  # (as if it were the next meal)
+    await poll(mon, f, state=0, param=0); await poll(mon, f, state=3, param=13, gram=70.0)
+    assert len(notes) == 4 and "about 2 g right now" in notes[3][1]
+    print("3 ok: reminder after 10 min; a re-jam at the same meal is logged, not re-alerted; the next meal alerts")
 
     # 4. bowl off the tray, then put back: measure the jump from when it came back
     mon, f, notes = make(); f.gram = -1.0
@@ -114,17 +118,18 @@ async def main():
         if c == 1: f.state, f.param = 1, 0
     f.on_cmd = clear; await poll(mon, f, 0)
     assert f.cmds == [0, 1], f.cmds
-    assert titles(notes) == ["Grinder jammed at the 03:55 meal", "Jam cleared at the 03:55 meal"], notes
+    assert titles(notes) == ["Grinder jammed at the 23:55 meal", "Jam cleared at the 23:55 meal"], notes
     await poll(mon, f)
     assert mon.store.db.execute("select outcome from jams").fetchone()[0] == "cleared by pause + resume (monitor)"
     # never clears -> two tries, then the urgent alert with the take-the-bowl-off advice
     mon, f, notes = auto(); await poll(mon, f, 0)
     assert f.cmds == [0, 1, 0, 1], f.cmds
-    assert titles(notes) == ["Grinder jammed at the 03:55 meal", "Feeder stuck: grinder jammed with food"], notes
+    assert titles(notes) == ["Grinder jammed at the 23:55 meal", "Feeder stuck: grinder jammed with food"], notes
     assert "tried 2 times, still jammed" in notes[-1][1] and "Take the bowl off" in notes[-1][1], notes[-1][1]
-    # a second jam at the same meal: no tries left -> straight to the urgent alert
+    # a second jam at the same meal: no more tries and no more alerts
+    n_before = len(notes)
     await poll(mon, f, state=1, param=0); await poll(mon, f, state=3, param=13)
-    assert f.cmds == [0, 1, 0, 1] and "already tried twice" in notes[-1][1], (f.cmds, notes[-1])
+    assert f.cmds == [0, 1, 0, 1] and len(notes) == n_before, (f.cmds, notes[n_before:])
     # pause refused -> the resume is still sent
     mon, f, notes = auto()
     async def refuse(a):
@@ -132,7 +137,7 @@ async def main():
         if int(a) == 0: raise RuntimeError("not allowed")
         clear(int(a))
     f.feed_control = refuse; await poll(mon, f, 0)
-    assert f.cmds == [0, 1] and titles(notes)[-1] == "Jam cleared at the 03:55 meal" and "pause refused" in tries(mon)[0]
+    assert f.cmds == [0, 1] and titles(notes)[-1] == "Jam cleared at the 23:55 meal" and "pause refused" in tries(mon)[0]
     # hopper taken out during the first try -> stops, no second try
     mon, f, notes = auto()
     def hand(c):
@@ -146,12 +151,12 @@ async def main():
     f.on_cmd = dump; await poll(mon, f, 0)
     assert f.cmds == [0, 1] and "45 g dropped into the bowl" in notes[-1][1], (f.cmds, notes[-1])
     # kill switch / policy off / bowl off the tray -> no commands, the urgent alert says why
-    for kw, why in (({"kill": True}, "automatic unjam is off"), ({"policy_off": True}, "automatic unjam is off"),
-                    ({}, "the bowl is off the tray")):
+    for kw, why in (({"kill": True}, "The meal is on hold"), ({"policy_off": True}, "The meal is on hold"),
+                    ({}, "The meal is on hold")):
         mon, f, notes = auto(**kw)
         if not kw: f.gram = 2.0
         await poll(mon, f, 0)
-        assert f.cmds == [] and titles(notes) == ["Feeder stuck: grinder jammed with food"] and why in notes[0][1], (kw, notes)
+        assert f.cmds == [] and titles(notes) == ["Feeder stuck: grinder jammed with food"] and notes[0][1].startswith(why), (kw, notes)
     print("8 ok: auto-unjam -> clears / two tries then alert / per-meal cap / pause refused / hand-clear / dump / off")
 
 asyncio.run(main())

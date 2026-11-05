@@ -148,11 +148,12 @@ class Policy:
     daily_gram_ceiling: float = 60.0        # never let the day's PLANNED food exceed this
     max_remediations_per_day: int = 8
     max_unclog_per_slot: int = 1
-    auto_unjam: bool = True                 # pause + resume on a grinder jam (code 13)
+    auto_unjam: bool = False                # pause + resume on a jam: 0 for 10 on a food jam (11-05)
     water_topup: bool = True                # add the water a meal was served without
     water_topup_min_g: float = 7.0          # one dose; normal meals come in 0-1 g short
     water_topup_max_g: float = 60.0
     water_topup_window_min: float = 30.0    # only for a meal served this recently
+    water_topup_eaten_g: float = 3.0        # bowl this far under what was served = he has started eating
     max_unjam_per_slot: int = 2             # tries per meal; after that, it's the owner's
     max_bowl_tare_fixes_per_day: int = 10  # beyond this, stop auto-fixing and escalate
     missed_feed_grace_min: float = 6.0      # minutes past the expected serve before "missed"
@@ -696,7 +697,12 @@ class Monitor:
         return self.p.max_unjam_per_slot - used
 
     async def _auto_unjam(self, slot: str) -> str | None:
-        """Clear a grinder jam (code 13) with pause, 20 s, resume.
+        """Clear a grinder jam (code 13) with pause, 20 s, resume. OFF by default
+        (Policy.auto_unjam): on 2026-11-05 it went 0 for 10 on a real food jam — each
+        resume restarts the grinder, nothing gets past the blockage, the feeder calls
+        it jammed again after a fixed ~90 s, and every resume restarts the feeder's
+        10-minute give-up timer, so the meal is held up longer. The one "success"
+        (07:50 the same day) jammed with the food already in; only water was left.
 
         The feeder never clears a jam by itself (0 of 30, 10-20 to 11-03); without a
         hand-clear it gives up at 10 minutes and serves a partial meal. On 2026-11-05
@@ -831,10 +837,14 @@ class Monitor:
                 self.n.action_needed(f"Feeder stuck: {name}",
                                      "Mechanical fault — not auto-retrying. Please check the grinder.")
                 return
-            why = "the bowl is off the tray" if food is None and bowl_off else None
-            if why is None and (not self.p.auto_unjam or self.dry_run or self.p.killswitch.exists()):
-                why = "automatic unjam is off (kill switch, dry run or policy)"
-            if why is None:
+            meal = f"{_today()} {slot}"
+            if self.store.get_setting("jam_alerted") == meal:
+                log.info("grinder jam again at the %s meal; already alerted for it", slot)
+                return                               # one alert per jammed meal
+            self.store.put_setting("jam_alerted", meal)
+            why = None
+            if self.p.auto_unjam and not (food is None and bowl_off) and not self.dry_run \
+                    and not self.p.killswitch.exists():
                 self.n.fyi(f"Grinder jammed at the {slot} meal",
                            "Trying to clear it with pause + resume. You'll hear back within two minutes.")
                 why = await self._auto_unjam(slot)
@@ -844,12 +854,12 @@ class Monitor:
                     return
             in_bowl = (f" The bowl holds about {max(0, food):.0f} g right now." if food is not None
                        else " The bowl is off the tray right now.")
+            tried = f"Couldn't clear it automatically ({why}). " if why else ""
             self.n.action_needed(
                 f"Feeder stuck: {name}",
-                f"Couldn't clear it automatically ({why}). The meal is on hold; without a hand-clear "
-                "it gives up at 10 minutes and serves what it has. Take the bowl off BEFORE you "
-                "clear it: food that has built up behind a jam can drop all at once, dry and "
-                f"uncounted (about 56 g did on Oct 12).{in_bowl}")
+                f"{tried}The meal is on hold; without a hand-clear it gives up at 10 minutes and "
+                "serves what it has. Take the bowl off BEFORE you clear it: food that has built "
+                f"up behind a jam can drop all at once, dry and uncounted (about 56 g did on Oct 12).{in_bowl}")
             return
         jam = self._jam
         jam["samples"].append((int(now), None if food is None else round(food, 1)))
@@ -1188,7 +1198,9 @@ class Monitor:
         The water owed is what the food that arrived should have had at the meal's
         own ratio, so a partial meal (food cut short too) owes nothing. Once per meal,
         only within water_topup_window_min of serving, never in the 20 minutes before
-        a scheduled meal, and only with the feeder idle and the bowl on."""
+        a scheduled meal, only with the feeder idle and the bowl on, and only while
+        the live scale shows the meal untouched: the feed retracts the tray for about
+        40 s, so if he has started eating it just sends a note."""
         food, water = feed.get("feed_weight") or 0, feed.get("water_weight") or 0
         plan_food, plan_water = feed.get("plan_feed_weight") or 0, feed.get("plan_water_weight") or 0
         if food <= 0 or plan_food <= 0 or plan_water <= 0:
@@ -1215,6 +1227,14 @@ class Monitor:
             why = f"the {soon[0]} meal is about to start"
         elif st.state != FeederState.IDLE or not st.bowl_in:
             why = "the feeder is busy or the bowl is off"
+        else:
+            # A water-only feed pulls the tray in for ~40 s: never from under him.
+            bowl = await self._bowl_now()
+            if bowl is None:
+                why = "the bowl couldn't be weighed"
+            elif bowl < food + water - self.p.water_topup_eaten_g:
+                why = (f"he's already eating it (the bowl has {bowl:.0f} g of the "
+                       f"{food + water:g} g served), and adding water pulls the bowl in")
         if why:
             log.info("meal %s: %d g of water short; not topping up: %s", when, owed, why)
             self.n.fyi(f"{when} meal came out {owed} g short on water",
@@ -1487,7 +1507,7 @@ def _current_slot_label(st: RikoStatus, tz_offset: int) -> str:
     for sl in st.schedule:
         if not sl.enabled:
             continue
-        d = abs(sl.seconds_from_midnight - sec)
+        d = abs(Schedule.seconds_since(sl.seconds_from_midnight, sec))   # wraps midnight: 00:05 is 10 min after 23:55
         if d < bestd:
             bestd, best = d, sl.hhmm
     return best

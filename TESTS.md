@@ -7,26 +7,6 @@ deleting them, so we don't re-run tests we've already done.
 
 ## High value
 
-### Can software clear a grinder jam? (armed, runs on the next jam)
-The feeder never clears a jam itself: of 30 from 10-20 to 11-03, 18 were cleared by
-hand (hopper out, stuck food removed, hopper back) and 12 timed out at 10 minutes and
-served a partial meal — so a jam with nobody home costs most of that meal.
-
-- **Test A, 2026-11-04 18:01 — answered: no while idle.** `foodProvide` on for 2 s with
-  the tray out, then 2 s and 5 s with the tray retracted (which put the feeder in
-  freshness protection, as in September): every call accepted, no sound from the
-  grinder, the scale moved less than 0.1 g. Extending the tray put it back to idle.
-- **Test B, 2026-11-05 07:50 — pause + resume worked once.** A one-time experiment in
-  the monitor ran on a real jam at the 07:55 meal (bowl 43.7 g, most of the meal already
-  in): pause, 20 s, still jammed; resume at 07:50:45, preparing again at 07:50:46. No
-  hopper removal was reported. The meal was served on time in full (6 + 41 g, bowl 51 g,
-  the usual 2–3 g over), so nothing extra dropped. The grinder-pulse step never ran.
-- **Now permanent:** `_auto_unjam` does pause → 20 s → resume on every code 13, up to
-  two tries per meal, and stops if the hopper is taken out or food drops in. **Still
-  open:** how often it works. A plain resume from the app didn't clear the 10-12 jam.
-  Read the `jams` table (outcome "cleared by pause + resume (monitor)" vs the rest) and
-  `remediations` kind `unjam_result` after a few more jams.
-
 ### Does the feeder work on battery, with no mains power?
 The schedule (`fdPlanStr`) and the clock live on the device, and there's a battery
 (90%, `pwrType: 0` = on DC), a `battSavingMode` property, and battery-low/critical
@@ -288,6 +268,30 @@ schedule, or a power blip. Not a Riko problem but worth finding.
 
 
 ## Answered
+
+### Can software clear a grinder jam? — answered 2026-11-05: no
+The feeder never clears a jam itself: of 30 from 10-20 to 11-03, 18 were cleared by
+hand (hopper out, stuck food removed, hopper back) and 12 timed out at 10 minutes and
+served a partial meal — so a jam with nobody home costs most of that meal.
+
+- **Test A, 2026-11-04 18:01 — answered: no while idle.** `foodProvide` on for 2 s with
+  the tray out, then 2 s and 5 s with the tray retracted (which put the feeder in
+  freshness protection, as in September): every call accepted, no sound from the
+  grinder, the scale moved less than 0.1 g. Extending the tray put it back to idle.
+- **Test B, 2026-11-05 07:50 — pause + resume worked once.** A one-time experiment in
+  the monitor ran on a real jam at the 07:55 meal (bowl 43.7 g, most of the meal already
+  in): pause, 20 s, still jammed; resume at 07:50:45, preparing again at 07:50:46. No
+  hopper removal was reported. The meal was served on time in full (6 + 41 g, bowl 51 g,
+  the usual 2–3 g over), so nothing extra dropped. The grinder-pulse step never ran.
+- **Test C, 2026-11-05 ~10:00 — pause + resume 10 times on a real food jam: 0 for 10.**
+  After every resume the feeder went back to preparing, re-declared the jam about 90 s
+  later, and the bowl stayed flat at 10.9–11.2 g. Each resume also restarted the
+  10-minute give-up timer, so trying makes an unattended jam last longer. Test B's
+  "success" was a meal whose food was already in; only water was left.
+- **Result:** `_auto_unjam` is kept but off (`auto_unjam=False`). The monitor sends one
+  urgent alert per jammed meal and you clear it by hand. The real fix was the food:
+  the duck bag jammed ~2.7 times a day, chicken none in 9 days.
+
 
 - **2026-09-07 — Is the bowl weight live?** No. `curWeight` is cached; polled every
   second through a 197 s dispense and it never moved. Refreshes only on physical

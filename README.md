@@ -290,26 +290,25 @@ grinder jam.
   left before, plus what the feeder says it served) and notifies you if the bowl is 8 g
   or more over. It stays quiet if the bowl was handled before the meal, because the
   "left before" figure can't be trusted then.
-- **When the grinder jams** (code 13) the monitor first tries to clear it: pause, wait
-  20 seconds, resume, then watch for a minute. Up to two tries per meal. You get a
-  low-priority note that it's trying, and another if it worked. The feeder never clears
-  a jam by itself — without help it gives up after 10 minutes and serves a partial
-  meal — and on 2026-11-05 a pause + resume cleared one in a second and the meal was
-  served in full.
-- **If that doesn't work** (or the kill switch is on, or the bowl is off the tray) you
-  get one urgent notification with the bowl's current weight and this advice: **take
-  the bowl off before you clear the jam.** Food that built up behind it can drop all at
-  once. While the feeder is stuck the monitor keeps weighing the bowl and tells you if
-  food drops in. It stops trying the moment the hopper is taken out or food drops in.
+- **When the grinder jams** (code 13) you get one urgent notification per meal, with
+  the bowl's current weight and this advice: **take the bowl off before you clear the
+  jam.** Food that built up behind it can drop all at once. While the feeder is stuck
+  the monitor keeps weighing the bowl and tells you if food drops in. If the same meal
+  jams again after you clear it, that's logged but not alerted again. The feeder never
+  clears a jam by itself — without help it gives up after 10 minutes and serves a
+  partial meal — and software can't either: pause + resume went 0 for 10 on a real
+  jam (see TESTS.md). That code (`auto_unjam`) is still there but off.
 
 - **When a meal comes out short on water** — the feeder serves when its soak timer runs
   out, wherever it is in the meal, so a meal held up by a jam can come out with all its
   food and only part of its water (5 g + 21 g instead of 5 + 35 on 2026-11-05) — the
   monitor adds the rest as a water-only feed right away and sends a low-priority note.
-  Water-only feeds don't soak, so the bowl is back in under a minute. It owes water
-  only for the food that actually arrived (a meal cut short keeps its own ratio), at
-  most 60 g, once per meal, within 30 minutes of serving, and never in the 20 minutes
-  before a scheduled meal; otherwise the note says how much would make it up.
+  A water-only feed doesn't soak but does pull the tray in for about 40 seconds, so it
+  only does this while the live scale shows the meal untouched; once he has started
+  eating you just get the note. It owes water only for the food that actually arrived
+  (a meal cut short keeps its own ratio), at most 60 g, once per meal, within 30
+  minutes of serving, and never in the 20 minutes before a scheduled meal; otherwise
+  the note says how much would make it up.
 
 Every jam is logged (table `jams` in `monitor.db`): the bowl's weight while stuck and
 how it ended — cleared by the monitor, cleared by hand, or timed out. Other grinder

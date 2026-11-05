@@ -15,7 +15,7 @@ def status(state=0, bowl_in=1, plan=PLAN):
                        "deviceState": {"value": {"state": state, "param": 0}},
                        "bowlStatus": {"value": {"bBowlIn": bowl_in, "curWeight": 95, "bowlGram": 68}}})
 
-def make(food, water, plan=(5, 35), ago=120, kill=False, policy_off=False):
+def make(food, water, plan=(5, 35), ago=120, kill=False, policy_off=False, bowl=None):
     now = int(time.time()); notes, feeds = [], []
     led = {"feed_list": [{"feed_time": now - ago, "status": 1, "way": "auto", "feed_weight": food,
                           "water_weight": water, "plan_feed_weight": plan[0], "plan_water_weight": plan[1],
@@ -24,6 +24,9 @@ def make(food, water, plan=(5, 35), ago=120, kill=False, policy_off=False):
         async def ledger(self, *a, **k): return led
     class Feeder:
         async def feed(self, f, w=None, **k): feeds.append((f, w))
+        async def live_scale(self):           # (grams on the tray, empty bowl): untouched by default
+            if bowl == "off": return 0.0, 68
+            return 68 + (food + water if bowl is None else bowl), 68
     n = types.SimpleNamespace(action_needed=lambda t, b: notes.append(("ACT", t, b)) or True,
                               fyi=lambda t, b: notes.append(("FYI", t, b)) or True)
     d = Path(tempfile.mkdtemp())
@@ -84,5 +87,16 @@ async def main():
     mon._served_at = time.time() - 60
     await mon.check_ledger_failures(status(plan=far())); assert feeds == [(0, 14)], feeds
     print("5 ok: a late meal (served 30 min after its slot) is still checked")
+
+    # 6. he has started eating, or the scale can't tell -> a note, the bowl is never pulled
+    M._near_a_feed_slot = lambda st, *a: True
+    for bowl, why in ((20, "already eating it"), ("off", "couldn't be weighed")):
+        mon, notes, feeds = make(5, 21, bowl=bowl)
+        await mon.check_ledger_failures(status(plan=far()))
+        assert feeds == [] and len(notes) == 1 and why in notes[0][2] and "14 g would make it up" in notes[0][2], (bowl, notes)
+    mon, notes, feeds = make(5, 21, bowl=24.5)        # scale noise / a lick: still counts as untouched
+    await mon.check_ledger_failures(status(plan=far()))
+    assert feeds == [(0, 14)], feeds
+    print("6 ok: not added once he is eating or the bowl can't be weighed; a lick still counts as untouched")
 
 asyncio.run(main())
