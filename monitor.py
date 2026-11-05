@@ -149,6 +149,10 @@ class Policy:
     max_remediations_per_day: int = 8
     max_unclog_per_slot: int = 1
     auto_unjam: bool = True                 # pause + resume on a grinder jam (code 13)
+    water_topup: bool = True                # add the water a meal was served without
+    water_topup_min_g: float = 7.0          # one dose; normal meals come in 0-1 g short
+    water_topup_max_g: float = 60.0
+    water_topup_window_min: float = 30.0    # only for a meal served this recently
     max_unjam_per_slot: int = 2             # tries per meal; after that, it's the owner's
     max_bowl_tare_fixes_per_day: int = 10  # beyond this, stop auto-fixing and escalate
     missed_feed_grace_min: float = 6.0      # minutes past the expected serve before "missed"
@@ -262,6 +266,7 @@ class Monitor:
         self._clock_held_for: str | None = None
         self._jam: dict | None = None      # the grinder fault in progress, if any
         self._sleep = asyncio.sleep        # replaced in tests
+        self._served_at: float | None = None   # when the feeder last went to SERVING
         self._in_pass = False              # inside check(): the ledger is fetched at most once
         self._pass_ledger: dict | None = None
         self._pass_ledger_failed = False
@@ -672,6 +677,8 @@ class Monitor:
         if cur != prev:
             self.store.log_feed(cur.name, st.state_param)
             self._last_state = cur
+            if cur == FeederState.SERVING or (prev == FeederState.PREPARING and cur == FeederState.IDLE):
+                self._served_at = time.time()  # a meal just went out, slot or not
 
         if st.state != FeederState.SUSPENDED or st.state_param not in NEVER_RETRY:
             if self._jam is not None:      # that grinder fault is over
@@ -1119,7 +1126,8 @@ class Monitor:
         work-state stuck) after we found a scheduled feed silently rejected with no
         error anywhere else in the telemetry — see reason4-finding.md.
         """
-        if not _near_a_feed_slot(st):
+        just_served = self._served_at is not None and time.time() - self._served_at < 20 * 60
+        if not _near_a_feed_slot(st) and not just_served:
             log.debug("ledger check: not near a feed slot, skipping")
             return
         try:
@@ -1139,6 +1147,10 @@ class Monitor:
                 continue
             newest = max(newest, ft)
             self._check_overdispense(ledger, f)   # failed meals too: a jam can dump uncounted food
+            try:
+                await self._check_water_short(st, f)
+            except Exception as exc:
+                log.warning("water top-up check failed: %r", exc)
             if f.get("status") == 1:
                 continue  # succeeded
             new_failures += 1
@@ -1162,6 +1174,59 @@ class Monitor:
 
         if newest > last_seen:
             self.store.put_setting("ledger_last_feed_time", str(newest))
+
+    async def _check_water_short(self, st: RikoStatus, feed: dict) -> None:
+        """Add the water a meal was served without, as a water-only manual feed.
+
+        The feeder serves when the soak timer runs out, wherever it is in the meal. On
+        2026-11-05 a jam held the 09:55 meal for 35 minutes; once it was cleared it put
+        in the last food and three of five water doses and served at once: 5 g + 21 g
+        instead of 5 + 35, food barely soaked. Water-only feeds don't soak (two 5 g
+        ones on 10-22 finished 41 s apart), so a top-up takes the bowl away for well
+        under a minute.
+
+        The water owed is what the food that arrived should have had at the meal's
+        own ratio, so a partial meal (food cut short too) owes nothing. Once per meal,
+        only within water_topup_window_min of serving, never in the 20 minutes before
+        a scheduled meal, and only with the feeder idle and the bowl on."""
+        food, water = feed.get("feed_weight") or 0, feed.get("water_weight") or 0
+        plan_food, plan_water = feed.get("plan_feed_weight") or 0, feed.get("plan_water_weight") or 0
+        if food <= 0 or plan_food <= 0 or plan_water <= 0:
+            return                                    # water-only feeds (including ours)
+        owed = round(food * plan_water / plan_food - water)
+        if owed < self.p.water_topup_min_g:
+            return
+        owed = min(owed, int(self.p.water_topup_max_g))
+        when = time.strftime("%H:%M", time.localtime(feed["feed_time"]))
+        served = f"{food:g} g food + {water:g} g water (planned {plan_food:g} + {plan_water:g})"
+        key = f"water {feed['feed_time']}"
+        if self.store.get_setting("water_topup_last") == key:
+            return
+        self.store.put_setting("water_topup_last", key)
+        why = None
+        sched = Schedule.from_status(st)
+        soon = [sl.hhmm for _, sl in (sched.active_today() if sched else [])
+                if 0 <= (sl.seconds_from_midnight - _tod()) % 86400 < 20 * 60]
+        if not self.p.water_topup or self.dry_run or self.p.killswitch.exists():
+            why = "automatic water top-up is off (kill switch, dry run or policy)"
+        elif time.time() - feed["feed_time"] > self.p.water_topup_window_min * 60:
+            why = "it was served too long ago"
+        elif soon:
+            why = f"the {soon[0]} meal is about to start"
+        elif st.state != FeederState.IDLE or not st.bowl_in:
+            why = "the feeder is busy or the bowl is off"
+        if why:
+            log.info("meal %s: %d g of water short; not topping up: %s", when, owed, why)
+            self.n.fyi(f"{when} meal came out {owed} g short on water",
+                       f"Served {served}. Not adding it automatically because {why}. "
+                       f"A water-only feed of {owed} g would make it up.")
+            return
+        await self.r.feed(0, owed)
+        self.store.record_remediation(when, "water_topup", f"{owed} g after {served}")
+        log.warning("meal %s: %s; added %d g of water", when, served, owed)
+        self.n.fyi(f"Added {owed} g of water to the {when} meal",
+                   f"It was served {served}, so its food didn't get all its water. "
+                   f"A water-only feed of {owed} g is on its way (no soak, under a minute).")
 
     def _check_overdispense(self, ledger: dict, feed: dict) -> None:
         """Alert when a meal leaves more in the bowl than the leftover plus what the

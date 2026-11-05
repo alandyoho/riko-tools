@@ -25,6 +25,7 @@ run "top-up"        $PY tests/test_topup.py
 run "over-dispense" $PY tests/test_overdispense.py $LEDGER
 run "clock"         $PY tests/test_clock.py
 run "grinder jam"   $PY tests/test_jam.py
+run "water top-up"  $PY tests/test_water.py
 run "power"         $PY tests/test_power.py $PROPS
 run "failover"      $PY tests/test_failover.py
 run "session"       $PY tests/test_session.py

@@ -302,6 +302,15 @@ grinder jam.
   once. While the feeder is stuck the monitor keeps weighing the bowl and tells you if
   food drops in. It stops trying the moment the hopper is taken out or food drops in.
 
+- **When a meal comes out short on water** — the feeder serves when its soak timer runs
+  out, wherever it is in the meal, so a meal held up by a jam can come out with all its
+  food and only part of its water (5 g + 21 g instead of 5 + 35 on 2026-11-05) — the
+  monitor adds the rest as a water-only feed right away and sends a low-priority note.
+  Water-only feeds don't soak, so the bowl is back in under a minute. It owes water
+  only for the food that actually arrived (a meal cut short keeps its own ratio), at
+  most 60 g, once per meal, within 30 minutes of serving, and never in the 20 minutes
+  before a scheduled meal; otherwise the note says how much would make it up.
+
 Every jam is logged (table `jams` in `monitor.db`): the bowl's weight while stuck and
 how it ended — cleared by the monitor, cleared by hand, or timed out. Other grinder
 faults (head missing, motor stalled) are never retried.
