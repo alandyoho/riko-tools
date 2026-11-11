@@ -13,7 +13,9 @@ and when rather than deleting it.
    before the slot, reports IDLE for 23-59 s, and sleeps again. No ledger record at all,
    not even a failure. The second meal ran both times we tried (11-09 17:55, 21:55), but
    only after it had been woken and fed by hand in between. Any power cut costs at least
-   one meal, silently.
+   one meal, silently. Likely cause (11-11): it wakes at the right real time, but its
+   clock is wrong after sleep (80 min fast, 15 min slow), so the meal isn't "now"; synced,
+   it tried the meal by itself within 36 s.
 2. **Its clock is unreliable across power changes.** Jumped 80 min ahead once on battery
    (11-09); gains ~1 min/hour asleep on battery; lost 20-30 min after short unplugs in
    Sept/Oct and never corrected itself. A wrong clock shifts every meal; a jump can skip one.
@@ -48,6 +50,9 @@ and when rather than deleting it.
     feed sent when it wakes idle; a button press before the next meal's prep is the second
     chance, then the meal is dropped (never doubled up); clock checked at the switch and
     every wake. Next: a hands-off unplug test, then a SwitchBot press as the fallback.*
+    *Proven live 2026-11-11 13:55: woke 13:47:23, clock synced, meal sent 13:47:31, served
+    13:52:46, no help. Side effect, still open: the feeder's own attempt at that meal
+    (13:48:00) was rejected "device busy" and raised a false urgent "Feed failed" alert.*
 14. **A manual feed can hide a missed meal.** The missed-meal check counts any feed within
     ~11 minutes of the slot as that meal's record (how the 11-09 15:55 miss went unalerted).
     The reverse is fixed (2026-11-11): a meal the monitor saw preparing or serving isn't

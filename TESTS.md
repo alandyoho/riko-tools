@@ -308,6 +308,20 @@ manual feeding will not be available".
   meals ever served on battery are the two second meals on 11-09 (17:55, 21:55), and both
   times it had been woken and fed by hand in between. **Not yet tested:** whether the
   second meal runs with no intervention after the first is skipped.
+- **2026-11-11 13:55 — the monitor's rescue, hands-off: worked.** Unplugged 13:17:15
+  (95%), asleep 13:18:19. Woke 13:47:23, IDLE. The monitor read the clock **15.1 min
+  slow** and synced it (13:47:24), confirmed still idle and sent 5 + 35 (13:47:31,
+  preparing at once). Served 13:52:46, asleep 13:53:31; the record (13:52:53, manual)
+  was in the ledger before it slept. **At 13:48:00 the feeder tried its own 13:55 meal**
+  and was rejected "device busy (FoodPreparing)" - one meal, no doubling, but a false
+  "Feed failed" alert.
+- **Hypothesis: the skip is the clock at wake.** It wakes at the right real time (~:47,
+  7-8 min before the slot, every time) but its clock after sleep is off: 80 min fast
+  (11-09 15:47), 15 min slow (11-11 13:47) - either way "not my meal time", so it sleeps.
+  Once synced it tried the meal by itself within 36 s. The 11-09 19:47 wake read only
+  50 s off, but ~7 s after waking, and the clock has been seen correcting itself just
+  after a wake. **Test (armed for 11-11 15:55):** sync the clock at the wake and send
+  nothing; does it run its own meal (full 10-min soak)?
 - **Follow-ups:** the open question above (SwitchBot wake: now the only rescue found);
   does the first meal fail if the cut starts during the 10-minute prep, or within a few
   minutes of the slot; the monitor's clock hold should not protect a meal whose slot
