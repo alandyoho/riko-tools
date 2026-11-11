@@ -310,6 +310,19 @@ grinder jam.
   minutes of serving, and never in the 20 minutes before a scheduled meal; otherwise
   the note says how much would make it up.
 
+- **When the feeder goes on battery** (its plug is out or the power is cut) you get an
+  urgent notification. On battery it sleeps between meals, can't be reached, and has
+  skipped its first scheduled meal every time (6 of 6, BUGS.md #1): it wakes for about
+  half a minute ~7 minutes before the slot, sits idle and sleeps again. So while it's on
+  battery and a meal is near, the monitor polls the cloud status every 3 seconds (8 over
+  cellular; this never touches the feeder) and, the moment it shows up idle with a meal
+  owed, waits 6 seconds and sends that meal as a manual feed. A meal whose wake was
+  missed is sent the next time it is awake (after its next meal, or when you press the
+  feed button once — a press wakes it without feeding). At most two meals at once, none
+  older than 3 hours, once per meal, within the daily ceiling, never while it is
+  preparing; the kill switch turns it into an alert. If the meal still hasn't run 6
+  minutes after the slot, the "meal hasn't run" alert tells you to press the button.
+
 Every jam is logged (table `jams` in `monitor.db`): the bowl's weight while stuck and
 how it ended — cleared by the monitor, cleared by hand, or timed out. Other grinder
 faults (head missing, motor stalled) are never retried.

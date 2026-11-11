@@ -172,6 +172,15 @@ class Policy:
     power_alert_after_s: float = 60.0       # on battery this long before "power is out"
     battery_low_v: float = 3.55             # "battery low" alert at or below this, on battery
     overdispense_alert_g: float = 8.0       # alert when a meal leaves this much more in the bowl than it should
+    # the FEEDER on battery: it sleeps between meals and skips the first one (BUGS.md #1)
+    battery_rescue: bool = True             # send a skipped battery meal while the feeder is awake
+    battery_watch_before_min: float = 15.0  # poll fast from this long before a slot...
+    battery_watch_after_min: float = 5.0    # ...to this long after it, while the feeder is on battery
+    battery_fast_poll_s: float = 3.0        # its pre-meal wake lasts 23-59 s
+    battery_fast_poll_cellular_s: float = 8.0
+    battery_confirm_s: float = 6.0          # still IDLE this long after waking = it isn't preparing
+    battery_rescue_max_age_h: float = 3.0   # don't send a meal older than this
+    battery_rescue_max_meals: int = 2       # at most this many owed meals in one feed
     killswitch: Path = field(default_factory=lambda: Path("riko_state/DISABLE_REMEDIATION"))
 
 
@@ -226,6 +235,22 @@ def _tod(t: float | None = None) -> int:
     return lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec
 
 
+def _on_battery(st: RikoStatus) -> bool:
+    """The FEEDER is on its own battery (pwrStatus.pwrType 1; 0 = mains)."""
+    p = st._p("pwrStatus", {}) or {}
+    return p.get("pwrType") == 1
+
+
+def _next_slot(st: RikoStatus) -> str | None:
+    """HH:MM of the next active meal from now, or None."""
+    sched = Schedule.from_status(st)
+    if sched is None:
+        return None
+    now = _tod()
+    ahead = sorted(((sl.seconds_from_midnight - now) % 86400, sl.hhmm) for _, sl in sched.active_today())
+    return ahead[0][1] if ahead else None
+
+
 def _near_a_feed_slot(st: RikoStatus, window_min: int = _LEDGER_WINDOW_MIN) -> bool:
     sched = Schedule.from_status(st)
     if sched is None:
@@ -268,6 +293,8 @@ class Monitor:
         self._jam: dict | None = None      # the grinder fault in progress, if any
         self._sleep = asyncio.sleep        # replaced in tests
         self._served_at: float | None = None   # when the feeder last went to SERVING
+        self._battery_st: RikoStatus | None = None   # last status, for the fast battery poll
+        self._battery_owed_hint = False    # a battery meal is owed: keep polling fast
         self._in_pass = False              # inside check(): the ledger is fetched at most once
         self._pass_ledger: dict | None = None
         self._pass_ledger_failed = False
@@ -371,6 +398,12 @@ class Monitor:
 
         self._check_levels(st)
         await self._check_state(st)
+        self._battery_st = st
+        try:
+            self._check_feeder_power(st)
+            await self._battery_rescue(st)
+        except Exception as exc:
+            log.warning("feeder battery check failed: %r", exc)
         await self._check_clock(st)
         try:
             await self._keep_clock(st)
@@ -1392,6 +1425,12 @@ class Monitor:
         slots = [sl.seconds_from_midnight for _, sl in sched.active_today()] if sched else []
         lead = max(0, st.default_feed.soak_min) * 60
         meal = self._sync_would_cost_a_meal(_tod(device), drift, lead, slots)
+        if meal and drift < 0 and not await self._meal_ran(meal):
+            # A fast clock "repeats" a meal only if that meal ran. On battery the feeder
+            # can skip it outright (2026-11-09 15:55: woke 80 min fast, no record) - then
+            # holding just keeps the clock wrong, and syncing back may even let it run.
+            log.info("clock: %s; the %s meal has no record, so syncing anyway", how, meal)
+            meal = None
         if meal:
             if self._clock_held_for != meal:
                 self._clock_held_for = meal
@@ -1459,11 +1498,225 @@ class Monitor:
         if self.store.get_setting(notified_key) == overdue.hhmm:
             return
         self.store.put_setting(notified_key, overdue.hhmm)
+        if _on_battery(st):
+            self.n.action_needed(
+                f"{overdue.hhmm} meal hasn't run — feeder on battery",
+                f"The feeder is on battery and skipped the {overdue.hhmm} meal (it has skipped the "
+                f"first meal on battery every time). It is asleep and can't be reached. Press its "
+                f"feed button ONCE to wake it: the monitor sends the meal within a few seconds "
+                f"(a press doesn't feed by itself). Or plug it back in.")
+            return
         self.n.action_needed(
             f"{overdue.hhmm} meal hasn't run",
             f"The {overdue.hhmm} meal is more than {self.p.missed_feed_grace_min:.0f} minutes overdue "
             f"with no record of it. If the feeder's clock is behind it may still serve late by "
             f"itself; if the app shows it as Expired, feed manually.")
+
+    # ---- the feeder on battery (BUGS.md #1, #12, #13) -------------------------------
+    def _check_feeder_power(self, st: RikoStatus) -> None:
+        """Alert when the FEEDER goes on battery, and when it is back on mains.
+
+        On battery it sleeps and can't be reached between meals, and it has skipped its
+        first scheduled meal every time (6 of 6, 2026-09 to 11-09). This is separate from
+        _check_power, which watches the Pi's own UPS: a knocked-out feeder plug with the
+        Pi still powered would otherwise go unnoticed until a meal was missed."""
+        since = self.store.get_setting("feeder_battery_since")
+        if _on_battery(st):
+            if since:
+                return
+            t = st.reported_at("pwrStatus") or time.time()
+            self.store.put_setting("feeder_battery_since", str(int(t)))
+            nxt = _next_slot(st)
+            meal = f"the {nxt} meal" if nxt else "its next meal"
+            log.warning("feeder on battery since %s", time.strftime("%H:%M:%S", time.localtime(t)))
+            self.n.action_needed(
+                "Feeder is on battery",
+                f"The feeder lost wall power at {time.strftime('%H:%M', time.localtime(t))} "
+                f"({st.battery_pct}%). On battery it sleeps between meals and can't be reached, and "
+                f"it has skipped its first meal on battery every time. The monitor will try to send "
+                f"{meal} during the minute the feeder wakes before it; if that fails you'll get a "
+                f"\"meal hasn't run\" alert. Plug it back in if you can.")
+        elif since:
+            self.store.put_setting("feeder_battery_since", "")
+            mins = (time.time() - float(since)) / 60
+            log.warning("feeder back on mains after %.0f min", mins)
+            self.n.fyi("Feeder back on wall power",
+                       f"It ran on battery for about {mins:.0f} min ({st.battery_pct}% left).")
+
+    def fast_poll_s(self, on_cellular: bool) -> float | None:
+        """How often to poll between full passes, or None for the normal interval. Fast
+        only while the feeder is on battery and a meal is near, or one is still owed:
+        its pre-meal wake lasts 23-59 s and the normal pass is 30 s. Polls read the
+        cloud's copy of the status, which never touches (or wakes) the feeder."""
+        st = self._battery_st
+        if st is None or not _on_battery(st) or not self.p.battery_rescue:
+            return None
+        sched = Schedule.from_status(st)
+        if sched is None:
+            return None
+        now = _tod()
+        near = any(-self.p.battery_watch_before_min * 60
+                   <= Schedule.seconds_since(sl.seconds_from_midnight, now)
+                   <= self.p.battery_watch_after_min * 60 for _, sl in sched.active_today())
+        if not near and not self._battery_owed_hint:
+            return None
+        return self.p.battery_fast_poll_cellular_s if on_cellular else self.p.battery_fast_poll_s
+
+    async def battery_tick(self) -> None:
+        """The fast poll: status only, plus a rescue if the feeder has just woken."""
+        try:
+            st = await self.r.status()
+        except Exception as exc:
+            log.debug("battery tick: status failed: %r", exc)
+            return
+        self._battery_st = st
+        if st.state == FeederState.SERVING and (self._served_at is None or time.time() - self._served_at > 600):
+            self._served_at = time.time()
+        await self._battery_rescue(st)
+
+    def _battery_seen(self) -> list[str]:
+        raw = self.store.get_setting("battery_meals_done")
+        try:
+            return json.loads(raw) if raw else []
+        except ValueError:
+            return []
+
+    def _battery_mark(self, keys: list[str]) -> None:
+        done = [k for k in self._battery_seen() if k not in keys] + keys
+        self.store.put_setting("battery_meals_done", json.dumps(done[-30:]))
+
+    def _slot_occurrences(self, st: RikoStatus) -> list[tuple[float, FeedSlot, str]]:
+        """Each active slot's most recent-or-next occurrence as (due unix time, slot,
+        key), for today and yesterday's late slots."""
+        sched = Schedule.from_status(st)
+        if sched is None:
+            return []
+        now = time.time()
+        midnight = now - _tod(now)
+        out = []
+        for _, sl in sched.active_today():
+            for day in (0, -86400):
+                due = midnight + day + sl.seconds_from_midnight
+                out.append((due, sl, f"{time.strftime('%Y-%m-%d', time.localtime(due))} {sl.hhmm}"))
+        return out
+
+    def _meal_seen_at(self, due: float, ledger: dict | None) -> bool:
+        """Did this meal run? A ledger record near it (stamped by the feeder's own clock,
+        which drifts a few minutes on battery) or a serve we saw ourselves."""
+        win = 20 * 60
+        if self._served_at is not None and abs(self._served_at - due) < win:
+            return True
+        return any(abs(f.get("feed_time", 0) - due) < win and (f.get("feed_weight") or 0) > 0
+                   for f in (ledger or {}).get("feed_list", []))
+
+    async def _meal_ran(self, hhmm: str) -> bool:
+        """For the clock hold: has the most recent `hhmm` meal run? If the ledger can't
+        be read, assume it did (holding is the cautious choice)."""
+        if self.neakasa is None:
+            return True
+        try:
+            ledger = await self._get_ledger()
+        except Exception:
+            return True
+        h, m = (int(x) for x in hhmm.split(":"))
+        now = time.time()
+        due = now - _tod(now) + h * 3600 + m * 60
+        if due > now + 12 * 3600:
+            due -= 86400
+        return self._meal_seen_at(due, ledger)
+
+    def _owed_meals(self, st: RikoStatus, ledger: dict | None) -> list[tuple[float, FeedSlot, str]]:
+        """Meals the feeder should have prepared while on battery and hasn't: due from
+        12 min ago..battery_rescue_max_age_h, on battery at its prep time, no record,
+        not already sent or seen. Includes a meal still to come if its prep time has
+        passed - that's the one the brief pre-meal wake is for."""
+        since_raw = self.store.get_setting("feeder_battery_since")
+        if not since_raw:
+            return []
+        since, now, done = float(since_raw), time.time(), self._battery_seen()
+        owed = []
+        for due, sl, key in self._slot_occurrences(st):
+            if not (due - 12 * 60 <= now <= due + self.p.battery_rescue_max_age_h * 3600):
+                continue
+            if since > due - 10 * 60 or key in done:
+                continue                            # on mains when it should have started
+            if self._meal_seen_at(due, ledger):
+                self._battery_mark([key])
+                continue
+            owed.append((due, sl, key))
+        return sorted(owed)
+
+    async def _battery_rescue(self, st: RikoStatus) -> None:
+        """Send a meal the feeder skipped on battery, in the moments it is awake.
+
+        On battery it wakes ~7 min before each slot. For its first meal it then sits
+        IDLE for 23-59 s and sleeps again; for a meal it does run it goes straight to
+        PREPARING (with an IDLE report the same second). So: when the cloud shows it
+        awake and IDLE with a meal owed, wait battery_confirm_s, and if it is still IDLE
+        send the meal as a manual feed. It accepts feeds while awake (2026-11-09 15:57
+        and 19:57); a manual feed on battery soaks ~6 min. The same goes for any later
+        moment it is awake (after the next meal, or a button press). Never while it
+        prepares or serves; once per meal; capped by age, count and the daily ceiling."""
+        if not self.p.battery_rescue or not _on_battery(st):
+            self._battery_owed_hint = False
+            return
+        if st.state in (FeederState.PREPARING, FeederState.SERVING):
+            near = [key for due, _, key in self._slot_occurrences(st) if abs(due - time.time()) < 20 * 60]
+            if near:
+                self._battery_mark(near)            # it's running a meal: that one isn't owed
+            return
+        if st.state != FeederState.IDLE:
+            return                                  # asleep (or faulted): nothing reaches it
+        try:
+            ledger = await self._get_ledger() if self.neakasa is not None else None
+        except Exception as exc:
+            log.info("battery rescue: ledger unreadable: %r", exc)
+            ledger = None
+        owed = self._owed_meals(st, ledger)
+        self._battery_owed_hint = bool(owed)
+        if not owed:
+            return
+        await self._sleep(self.p.battery_confirm_s)
+        try:
+            st2 = await self.r.status()
+        except Exception:
+            return
+        if st2.state != FeederState.IDLE:
+            if st2.state in (FeederState.PREPARING, FeederState.SERVING):
+                self._battery_mark([k for due, _, k in owed if abs(due - time.time()) < 20 * 60])
+            log.info("battery rescue: feeder went %s, not sending", st2.state.name)
+            return
+        owed = owed[-self.p.battery_rescue_max_meals:]
+        food = sum(sl.food_g for _, sl, _ in owed)
+        water = sum(sl.water_g for _, sl, _ in owed)
+        labels = " + ".join(sl.hhmm for _, sl, _ in owed)
+        midnight = time.time() - _tod()
+        fed_today = sum(f.get("feed_weight") or 0 for f in (ledger or {}).get("feed_list", [])
+                        if f.get("feed_time", 0) >= midnight and f.get("status") == 1)
+        allowed, why = self._remediation_allowed(food, fed_today)
+        if not allowed:
+            keys = [k for _, _, k in owed]
+            if self.store.get_setting("battery_rescue_blocked") != keys[-1]:
+                self.store.put_setting("battery_rescue_blocked", keys[-1])
+                self.n.action_needed(f"{labels} meal not sent — {why}",
+                                     f"The feeder is on battery and awake, and the {labels} meal is owed, "
+                                     f"but the monitor won't send it: {why}. Feed it from the app now, while "
+                                     f"it is awake.")
+            return
+        try:
+            await self.r.feed(food, water)
+        except Exception as exc:
+            log.warning("battery rescue: feed failed (asleep again?): %r", exc)
+            return                                  # owed still; next time it's awake
+        self._battery_mark([k for _, _, k in owed])
+        self._battery_owed_hint = False
+        self.store.record_remediation(labels, "battery_rescue", f"sent {food:g} g + {water:g} g")
+        log.warning("battery rescue: sent the %s meal (%g g + %g g)", labels, food, water)
+        self.n.fyi(f"Sent the {labels} meal — feeder on battery",
+                   f"The feeder is on battery and was about to skip the {labels} meal. It was awake "
+                   f"for a moment, so the monitor sent {food:g} g food + {water:g} g water as a manual "
+                   f"feed (it soaks ~6 min on battery).")
+
 
 # ---- slot math (planned intake + which slot we're in) ----------------------
 def _fmt(value: Any) -> str:
@@ -1564,15 +1817,29 @@ async def main() -> int:
         log.info("monitor running, %.0fs interval; top-up %s", args.interval,
                  policy.topup_mode if neakasa_client else "off (needs the ledger)")
         failover_flag = cfg.state_dir / "FAILOVER"   # set by wifi_failover.py during a takeover
+        next_full = 0.0
         while True:
-            try:
-                await mon.check()
-            except Exception:
-                log.exception("check pass failed")
             # every poll over cellular spends the SIM's small data allowance
             on_cellular = failover_flag.exists()
-            await asyncio.sleep(max(args.interval, FAILOVER_INTERVAL_S) if on_cellular
-                                else args.interval)
+            if time.monotonic() >= next_full:
+                try:
+                    await mon.check()
+                except Exception:
+                    log.exception("check pass failed")
+                next_full = time.monotonic() + (max(args.interval, FAILOVER_INTERVAL_S)
+                                                if on_cellular else args.interval)
+            # between full passes: a quick status poll while the feeder is on battery
+            # near a meal, to catch the short moment it is awake
+            fast = mon.fast_poll_s(on_cellular)
+            if fast is None:
+                await asyncio.sleep(max(0.0, next_full - time.monotonic()))
+                continue
+            await asyncio.sleep(min(fast, max(0.0, next_full - time.monotonic())))
+            if time.monotonic() < next_full:
+                try:
+                    await mon.battery_tick()
+                except Exception:
+                    log.exception("battery tick failed")
 
 
 if __name__ == "__main__":

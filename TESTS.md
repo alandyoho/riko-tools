@@ -7,18 +7,20 @@ deleting them, so we don't re-run tests we've already done.
 
 ## High value
 
-### Does the feeder work on battery, with no mains power?
-The schedule (`fdPlanStr`) and the clock live on the device, and there's a battery
-(90%, `pwrType: 0` = on DC), a `battSavingMode` property, and battery-low/critical
-error codes — so it *should* keep feeding through a power cut. Never verified.
+### Can the monitor rescue a missed meal while the feeder is on battery?
+On battery the feeder sleeps and is unreachable between meals (see Answered,
+2026-11-09). A single press of the feed button wakes it with no feed, and it then takes
+commands. So a SwitchBot Bot on the feed button, pressed from the Pi over Bluetooth (no
+hub, no internet), could wake it to fix the clock or send a missed meal.
 
-- Unplug the Riko 10 minutes before a scheduled slot. Watch the display and see
-  whether the meal fires on time.
-- Check `pwrStatus.pwrType` flips to 1 and what `batPercentage` does over the cycle.
-- Note whether it behaves differently in `battSavingMode`.
-- **Why it matters:** this is the difference between a feeder that survives an
-  outage and one that silently doesn't. Also decides how much the monitoring layer
-  needs to care about power events.
+- Mount the Bot on the feed button; check it hits squarely every time.
+- Install `pySwitchbot` (uses `bleak`) on the Pi; press from the Pi while the feeder sleeps
+  on battery; confirm it comes online and takes `device_time` and a feed.
+- Find out what a press does while the feeder is AWAKE (a feed would mean an extra meal)
+  - the monitor should only press when the feeder is unreachable.
+- How long does it stay awake after a wake press? (17:56 -> 17:57 on 11-09: about a minute.)
+- Does the 80-minute clock jump happen every time it switches to battery? Unplug again
+  with the passive watcher and read the clock at the next wake.
 
 ### Does it keep feeding with no internet?
 Same reasoning — schedule and clock are local, so it should. But the clock is
@@ -268,6 +270,52 @@ schedule, or a power blip. Not a Riko problem but worth finding.
 
 
 ## Answered
+
+### Does the feeder work on battery? — answered 2026-11-09: yes, but it skips the first meal
+Firmware 1.0.1-0007. Unplugged 15:36:40 (`pwrType` 0 -> 1, 90%, 12.0 V). The app calls
+this "Long Battery Mode": display and sound off, it sleeps except while preparing a
+scheduled meal, wakes for the schedule or one press of the feed button, and "remote
+manual feeding will not be available".
+
+- **Sleeps and drops off the network** 40 s after going on battery. While asleep every
+  command fails with 20056; the cloud keeps the last status (SLEEPING). Polling it every
+  3 s kept it awake (16:03-16:11), so watch passively (cloud status only).
+- **15:55 meal lost to a clock jump.** It woke at 15:47:47 with its clock 80.3 min FAST
+  (17:07), so the meal was already "past" and it stayed idle. After syncing the clock at
+  15:55:38 (landing on the slot) it still did not serve. No ledger record, not even a
+  failure. The monitor's clock keeper held off the sync, thinking a sync would repeat
+  the 15:55 meal that had in fact never run.
+- **Manual feed on battery works while it is awake:** sent 15:57:53, preparing at once,
+  5 + 34 served at 16:03:48 after a 6-minute soak (normally 10).
+- **Scheduled meal on battery works:** asleep 16:11:45 -> preparing ~17:43 (seen by the
+  cloud only at 17:46:19, ~3 min in) -> served ~17:53 -> asleep 17:53:58. 5 + 34 of 5 + 35,
+  recorded at 17:55:07 by its own clock. The clock was 107 s fast after 1 h 40 m asleep.
+- **Button wake:** one press at ~17:56 -> IDLE and reachable at 17:56:02, no feed. Clock
+  then 4 s off (it seems to correct itself once connected). Child lock did not block it.
+- **Battery:** 90% -> 85% (12.0 -> 11.88 V) over 2 h 20 m and two meals.
+- **Repeat, 19:31 (passive watch only, monitor kill switch on): the FIRST meal on battery
+  is lost even with a correct clock.** On battery 19:31:03 (95%), asleep 19:31:33, woke
+  19:47:40 with the clock 50 s slow, IDLE (should have been preparing for 19:55), asleep
+  again 19:48:39. Nothing more until a button press at 19:56:58 (IDLE, empty bowl).
+  Rescue feed 5 + 35 sent 19:57:27, preparing at 19:57:31. So the 80-minute jump is not
+  every time, and it was not what lost the 15:55 meal: both runs woke at about :47, sat
+  idle and skipped the first meal; the second meal (17:55) ran. Any power cut that starts
+  more than ~10 minutes before a meal costs that meal.
+- **Second meal again ran on its own:** asleep 20:04:56 -> preparing (first seen 21:46:19,
+  ~3 min after it started) -> served 21:53:19 = 21:55 by its clock, which was 101 s fast
+  after ~1 h 40 m asleep (~+1 min/h, same as the afternoon). Battery 95% -> 90%.
+- **History (riko_capture/pushes.jsonl, every power/state push since 09-06): the first meal
+  on battery failed every time, 6 of 6.** 09-09 (16:00 meal), 09-10 (12:00), 09-16 (12:00),
+  09-26 (16:00, nearly 4 h on battery), 11-09 15:55 and 19:55: each time it woke briefly
+  8-15 minutes before the slot, sat idle ~30 s and went back to sleep. The only scheduled
+  meals ever served on battery are the two second meals on 11-09 (17:55, 21:55), and both
+  times it had been woken and fed by hand in between. **Not yet tested:** whether the
+  second meal runs with no intervention after the first is skipped.
+- **Follow-ups:** the open question above (SwitchBot wake: now the only rescue found);
+  does the first meal fail if the cut starts during the 10-minute prep, or within a few
+  minutes of the slot; the monitor's clock hold should not protect a meal whose slot
+  already passed with no record.
+
 
 ### Can software clear a grinder jam? — answered 2026-11-05: no
 The feeder never clears a jam itself: of 30 from 10-20 to 11-03, 18 were cleared by
