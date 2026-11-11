@@ -31,8 +31,7 @@ and when rather than deleting it.
 8. **Lifting the bowl cancels that meal's eat record.**
 9. **The app resets an edited meal to a 1:5 food:water ratio.** Write schedules through
    the API (riko.Schedule) instead.
-10. **Security: the device-info endpoint returns the feeder's cloud secret,** even to a
-    shared account.
+10. **A security issue in Neakasa's cloud API.** Details are kept out of this public repo.
 
 ## Monitor / Pi
 
@@ -69,6 +68,6 @@ and when rather than deleting it.
 
 ## Housekeeping
 
-21. **The ntfy topic `riko-sailor` is guessable** — anyone could read alerts or send fake ones.
-22. **Change the Neakasa password.** It was pasted in plaintext during setup and its unsalted
-    md5 is in captured traffic.
+21. **Rename the ntfy topic to something unguessable.** Anyone who knows a topic can read
+    its alerts or send fake ones.
+22. **Change the Neakasa account password.** It was exposed during setup.

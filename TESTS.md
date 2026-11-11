@@ -226,8 +226,8 @@ Would answer the `sign` question and possibly the `cfgRead` filenames. iOS apps 
 encrypted on device, so this needs an Android phone — `strings` over the native libs
 plus `jadx` on the Java. Not worth a jailbreak.
 
-Note the app shares `appKey: 32711645` across both backends, so the Neakasa-side
-secret is probably paired to it and baked into the binary.
+The app uses the same app key on both backends, so the Neakasa-side secret is probably
+paired to it and baked into the binary.
 
 
 
@@ -256,17 +256,14 @@ schedule, or a power blip. Not a Riko problem but worth finding.
 ## Chores / cleanup
 
 - **[DONE] Removed the mitmproxy CA cert from the iPhone** (2026-09-07). Proxy also off.
-- **Rename the ntfy topic to something unguessable.** Currently `riko-sailor` in
-  `riko.toml` — short and guessable, so anyone could read the alerts or push fake
-  ones. Change it in the toml AND in the ntfy phone app. Also: `riko config` prints
-  `_notify` in cleartext; harmless but the topic is a mild secret.
-- **Change the Neakasa account password.** It was pasted in plaintext during setup
-  and its md5 appears in captured traffic; md5 is unsalted/reversible. Change it and
+- **Rename the ntfy topic to something unguessable.** The current one is short and
+  guessable, so anyone could read the alerts or push fake ones. Change it in the toml
+  AND in the ntfy phone app. `riko config` prints the topic in cleartext; treat it as a
+  mild secret.
+- **Change the Neakasa account password.** It was exposed during setup. Change it and
   don't reuse it. (Then update `.env` / `riko.toml` on the Pi.)
-- **Scrub captures before publishing anything.** `riko_capture/tsl_thing_info_get*`
-  contains the device secret, MAC, and public IP; intercepted ledger/login bodies
-  contain user_id, the md5 password, and signed OSS URLs. All gitignored, but check
-  before sharing logs or a repo.
+- **Scrub captures before publishing anything.** `riko_capture/` holds device
+  identifiers and account data. All gitignored, but check before sharing logs or a repo.
 
 
 ## Answered
