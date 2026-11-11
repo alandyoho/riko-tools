@@ -92,20 +92,30 @@ async def main():
     assert f.feeds == [], "21:55 ran; nothing owed"
     print("C ok: idle-then-preparing is a meal it runs -> left alone, and not owed afterwards")
 
-    # D. catch-up: 19:55 skipped and its wake missed; 21:55 runs; in the idle after it, 19:55 is sent
+    # D. no doubling up: 19:55 skipped and its wake missed; 21:55 runs; nothing extra after it
     mon, f, led, notes = make()
     await unplug(mon, f, 19, 31, 3)
     at(21, 46, 19); f.state = 1; await mon.battery_tick()       # preparing 21:55
     at(21, 53, 26); f.state = 0; await mon.battery_tick()
-    assert f.feeds == [(5, 35)] and "19:55 meal" in notes[-1][1], (f.feeds, notes[-1])
-    print("D ok: missed 19:55 sent in the idle moment after 21:55 ->", notes[-1][1])
+    assert f.feeds == [], f.feeds
+    print("D ok: a missed 19:55 is dropped once 21:55 starts preparing, never sent with it")
 
-    # D2. two owed meals at once -> one feed, capped at two meals
+    # D2. a button press after the missed wake, before the next prep -> that one meal is sent...
+    mon, f, led, notes = make()
+    await unplug(mon, f, 19, 31)
+    at(20, 10); f.state = 0; await mon.battery_tick()
+    assert f.feeds == [(5, 35)] and notes[-1][1] == "Sent the 19:55 meal — feeder on battery", (f.feeds, notes[-1])
+    # ...but not once the next meal's prep time (21:45) has passed: then only 21:55 is owed
+    mon, f, led, notes = make()
+    await unplug(mon, f, 19, 31)
+    at(21, 50); f.state = 0; await mon.battery_tick()
+    assert f.feeds == [(5, 35)] and notes[-1][1] == "Sent the 21:55 meal — feeder on battery", (f.feeds, notes[-1])
+    # ...and three meals skipped while nobody was watching -> only the current one, never several
     mon, f, led, notes = make()
     await unplug(mon, f, 15, 31)
     at(19, 47, 40); f.state = 0; await mon.battery_tick()
-    assert f.feeds == [(10, 70)] and "17:55 + 19:55" in notes[-1][1], (f.feeds, notes[-1])
-    print("D2 ok: 15:55, 17:55 and 19:55 owed -> the latest two sent together:", notes[-1][1])
+    assert f.feeds == [(5, 35)] and notes[-1][1] == "Sent the 19:55 meal — feeder on battery", (f.feeds, notes[-1])
+    print("D2 ok: a press before the next prep gets the missed meal; after it, only the current one; one at a time")
 
     # E. on mains at its prep time (unplugged 19:50) -> not a battery miss; nothing sent
     mon, f, led, notes = make()
@@ -156,6 +166,32 @@ async def main():
     await mon._keep_clock(await f.status())
     assert f.syncs == [] and any("fixing it after the 15:55" in n[1] for n in notes), (f.syncs, notes)
     print("I ok: a fast clock is synced when the meal it 'protects' has no record; held when it ran")
+
+    # K. the clock on battery: checked the moment it switches (awake ~30-40 s), synced if wrong
+    mon, f, led, notes = make()
+    at(14, 0); f.state, f.pwr, f.fast = 0, 1, -200.0             # 3.3 min slow, far from meals
+    st = await f.status(); mon._check_feeder_power(st); await mon._battery_rescue(st)
+    assert len(f.syncs) == 1 and f.fast == 0, f.syncs
+    await mon._battery_rescue(await f.status()); assert len(f.syncs) == 1, "once per wake"
+    # ...and at every wake after: 80 min fast at the 19:47 wake -> synced first, then the meal sent
+    mon, f, led, notes = make()
+    await unplug(mon, f, 19, 31)
+    at(19, 47, 40); f.state, f.fast = 0, 80.3 * 60
+    await mon.battery_tick()
+    assert len(f.syncs) == 1 and f.feeds == [(5, 35)], (f.syncs, f.feeds)
+    print("K ok: clock checked at the switch and at each wake on battery; synced before the rescue")
+
+    # L. the missed-meal alert counts meals seen running, not just ledger records (late upload)
+    mon, f, led, notes = make()
+    await unplug(mon, f, 19, 31)
+    at(19, 47); f.state = 1; await mon.battery_tick()           # seen preparing 19:55, no record yet
+    at(20, 2); f.state = 5; await mon._check_missed_meal(await f.status())
+    assert not any("hasn't run" in n[1] for n in notes), notes
+    mon, f, led, notes = make()
+    mon._served_at = real.mktime((2026, 11, 9, 19, 53, 20, 0, 0, -1))   # seen serving on mains
+    at(20, 2); f.state, f.pwr = 0, 0; await mon._check_missed_meal(await f.status())
+    assert not any("hasn't run" in n[1] for n in notes), notes
+    print("L ok: a meal seen preparing or serving isn't reported missed while its record is late")
 
     # J. the missed-meal alert says what to do when the feeder is on battery
     mon, f, led, notes = make()

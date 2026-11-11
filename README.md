@@ -311,17 +311,20 @@ grinder jam.
   the note says how much would make it up.
 
 - **When the feeder goes on battery** (its plug is out or the power is cut) you get an
-  urgent notification. On battery it sleeps between meals, can't be reached, and has
-  skipped its first scheduled meal every time (6 of 6, BUGS.md #1): it wakes for about
-  half a minute ~7 minutes before the slot, sits idle and sleeps again. So while it's on
-  battery and a meal is near, the monitor polls the cloud status every 3 seconds (8 over
+  urgent notification, and the monitor checks the feeder's clock in the half-minute it
+  stays awake after switching, fixing it if it's off. It does the same at every later
+  wake on battery: asleep, the clock gains about a minute an hour, and once jumped 80
+  minutes. On battery the feeder sleeps between meals, can't be reached, and has skipped
+  its first scheduled meal every time (6 of 6, BUGS.md #1): it wakes for about half a
+  minute ~7 minutes before the slot, sits idle and sleeps again. So while it's on battery
+  and a meal is near, the monitor polls the cloud status every 3 seconds (8 over
   cellular; this never touches the feeder) and, the moment it shows up idle with a meal
-  owed, waits 6 seconds and sends that meal as a manual feed. A meal whose wake was
-  missed is sent the next time it is awake (after its next meal, or when you press the
-  feed button once — a press wakes it without feeding). At most two meals at once, none
-  older than 3 hours, once per meal, within the daily ceiling, never while it is
-  preparing; the kill switch turns it into an alert. If the meal still hasn't run 6
-  minutes after the slot, the "meal hasn't run" alert tells you to press the button.
+  owed, waits 6 seconds and sends that meal as a manual feed. If that moment is missed,
+  you get a "meal hasn't run" alert: press the feed button once (a press wakes it
+  without feeding) and the monitor sends the meal — but only until the next meal starts
+  preparing. After that the missed meal is dropped, never served together with the next
+  one. One meal at a time, once per meal, within the daily ceiling, never while it is
+  preparing; the kill switch turns it into an alert.
 
 Every jam is logged (table `jams` in `monitor.db`): the bowl's weight while stuck and
 how it ended — cleared by the monitor, cleared by hand, or timed out. Other grinder

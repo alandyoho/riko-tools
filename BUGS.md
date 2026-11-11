@@ -46,10 +46,13 @@ and when rather than deleting it.
 13. **No rescue for a skipped battery meal.** The missed-meal check only alerts, and the
     30 s pass is too slow to catch the 23-59 s wake.
     *Built 2026-11-11, not yet proven live: fast cloud-status poll near meals on battery,
-    feed sent when it wakes idle; catch-up at its next wake; the alert says to press the
-    button. Next: an unplug test, then a SwitchBot press as the fallback.*
+    feed sent when it wakes idle; a button press before the next meal's prep is the second
+    chance, then the meal is dropped (never doubled up); clock checked at the switch and
+    every wake. Next: a hands-off unplug test, then a SwitchBot press as the fallback.*
 14. **A manual feed can hide a missed meal.** The missed-meal check counts any feed within
     ~11 minutes of the slot as that meal's record (how the 11-09 15:55 miss went unalerted).
+    The reverse is fixed (2026-11-11): a meal the monitor saw preparing or serving isn't
+    reported missed while its ledger record is late (battery meals may upload late).
 15. **The water top-up can only add water after serving,** and not once he is eating. By
     design, but a jam-delayed meal can still end up under-soaked.
 16. **The monitor doesn't know firmware 0007's error code 63** ("cat interference –
@@ -58,11 +61,14 @@ and when rather than deleting it.
     stale files linger (an outdated tests/test_topup.py failed on 11-05).
 18. **The Pi's UPS lasts ~2 hours** and its low-battery safe-idle path has never run on the
     real Pi. The feeder's battery outlasts the Pi.
-19. **Cellular "relay" mode (router up, internet down) failed its live test** and is off,
+19. **The Pi keeps only about a day of system logs** (on 11-11 the oldest monitor entry was
+    11-10 21:47), so incidents have to be read within a day; riko_capture/pushes.jsonl and
+    monitor.db are the long-term record.
+20. **Cellular "relay" mode (router up, internet down) failed its live test** and is off,
     so that case isn't covered.
 
 ## Housekeeping
 
-20. **The ntfy topic `riko-sailor` is guessable** — anyone could read alerts or send fake ones.
-21. **Change the Neakasa password.** It was pasted in plaintext during setup and its unsalted
+21. **The ntfy topic `riko-sailor` is guessable** — anyone could read alerts or send fake ones.
+22. **Change the Neakasa password.** It was pasted in plaintext during setup and its unsalted
     md5 is in captured traffic.
