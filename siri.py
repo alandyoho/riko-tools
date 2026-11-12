@@ -4,6 +4,7 @@ siri.sh. Each command prints ONE short sentence, meant to be spoken back by Siri
     siri.sh resume      resume a paused or stopped meal
     siri.sh status      state, power, food and water, last and next meal, bowl
     siri.sh pause       pause a meal that is preparing (it holds its food until resumed)
+    siri.sh feed        an extra meal at the default amounts (5 g + 35 g), with guards
 """
 from __future__ import annotations
 
@@ -19,6 +20,8 @@ from riko import ERROR_CODES, FeedCtrl, FeederState, FoodLevel, Riko, Schedule, 
 
 LOG = Path(__file__).resolve().parent / "riko_state" / "siri.log"
 JAM = 13          # grinder jammed with food: resume doesn't clear it (0 of 10, 2026-11-05)
+RECENT_MIN = 20   # "feed" refuses within this long of the last meal - safe to say twice
+DAILY_MAX_G = 60  # same ceiling as the monitor's daily_gram_ceiling
 
 
 def _log(cmd: str, said: str) -> None:
@@ -134,7 +137,48 @@ async def status(r: Riko, ledger_client=None, device: str = "", owner: int | Non
     return " ".join(parts)
 
 
-COMMANDS = {"resume": resume, "status": status, "pause": pause}
+async def feed(r: Riko, ledger_client=None, device: str = "", owner: int | None = None) -> str:
+    st = await r.status()
+    if st.state == FeederState.SLEEPING:
+        return "The feeder is asleep on battery and can't take a feed. Press its button once, then try again."
+    if st.state in (FeederState.PREPARING, FeederState.SERVING):
+        return f"It's already {st.state.name.lower()} a meal."
+    if st.state != FeederState.IDLE:
+        why = "paused" if st.state_param == 5 else ERROR_CODES.get(st.state_param, f"code {st.state_param}")
+        return f"The feeder is stopped ({why}). Sort that out first."
+    if not st.bowl_in:
+        return "The bowl is off the tray. Put it back first."
+    d = st.default_feed
+    food, water = d.food_g or 5.0, d.water_g or 35.0
+    if ledger_client is None:
+        return "I couldn't check when he last ate, so I didn't feed. Try again in a minute."
+    try:
+        led = await ledger_client.ledger(device, days=1, owner_user_id=owner)
+    except Exception:
+        return "I couldn't check when he last ate, so I didn't feed. Try again in a minute."
+    now = time.time()
+    lt = time.localtime(now)
+    midnight = now - (lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec)
+    served = [f for f in led.get("feed_list", []) if (f.get("feed_weight") or 0) > 0]
+    recent = [f for f in served if now - f["feed_time"] < RECENT_MIN * 60]
+    if recent:
+        f = max(recent, key=lambda x: x["feed_time"])
+        return (f"He had a meal at {_clock(f['feed_time'])}, under {RECENT_MIN} minutes ago, "
+                f"so I didn't feed again.")
+    fed_today = sum(f["feed_weight"] for f in served if f["feed_time"] >= midnight)
+    sched = Schedule.from_status(st)
+    sec_now = now - midnight
+    still_planned = sum(sl.food_g for _, sl in (sched.active_today() if sched else [])
+                        if sl.seconds_from_midnight > sec_now)
+    if fed_today + still_planned + food > DAILY_MAX_G:
+        return (f"That would put today over {DAILY_MAX_G} grams: {_g(fed_today)} so far and "
+                f"{_g(still_planned)} still scheduled. I didn't feed.")
+    await r.feed(food, water)
+    ready = _clock(now + (d.soak_min or 10) * 60 + 30)
+    return f"Feeding {_g(food)} grams with {_g(water)} of water. It'll be ready around {ready}."
+
+
+COMMANDS = {"resume": resume, "status": status, "pause": pause, "feed": feed}
 
 
 async def main() -> int:
@@ -146,14 +190,14 @@ async def main() -> int:
     try:
         async with Riko.from_config(load()) as r:
             r.relogin = r.login               # share the account's one session with the monitor
-            if cmd == "status":
+            if cmd in ("status", "feed"):
                 cfg = load()
                 owner = getattr(cfg, "feeder_owner_id", 0) or None
                 led = None
                 if owner:
                     from neakasa import Feeder as NeakasaFeeder
                     led = NeakasaFeeder(client=r.client)
-                said = await status(r, led, r.device.device_name, owner)
+                said = await COMMANDS[cmd](r, led, r.device.device_name, owner)
             else:
                 said = await COMMANDS[cmd](r)
     except Exception as exc:

@@ -65,4 +65,33 @@ async def main():
         assert f.sent == [] and words in said, (state, param, said)
     print("ok: pause -> only while preparing; serving/stopped/idle/asleep -> nothing sent")
 
+    # feed: the default meal, refused when running, asleep, bowl off, fed recently, or over the day's max
+    import time as T
+    class FF(S):
+        def __init__(self, **p):
+            super().__init__(**p); self.fed = []
+        async def status(self):
+            st = await super().status()
+            st.raw["defFdCfg"] = {"value": {"food": 5, "water": 35, "mixMin": 10}}
+            st.raw["bowlStatus"] = {"value": {"bBowlIn": 0 if self.p.get("bowl_off") else 1, "curWeight": 68, "bowlGram": 68}}
+            return st
+        async def feed(self, f, w): self.fed.append((f, w))
+    class Led:
+        def __init__(self, feeds): self.feeds = feeds
+        async def ledger(self, *a, **k): return {"feed_list": self.feeds}
+    now = T.time()
+    lt = T.localtime(now); midnight = now - (lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec)
+    f = FF(); said = await siri.feed(f, Led([{"feed_time": now - 3600, "feed_weight": 5}]))
+    assert f.fed == [(5, 35)] and said.startswith("Feeding 5 grams with 35 of water."), said
+    cases = [(dict(state=1), [], "already preparing"), (dict(state=5), [], "asleep"),
+             (dict(state=3, param=5), [], "stopped (paused)"), (dict(bowl_off=True), [], "bowl is off"),
+             (dict(), [{"feed_time": now - 600, "feed_weight": 5}], "under 20 minutes ago"),
+             (dict(), [{"feed_time": midnight + 60, "feed_weight": 57}], "over 60 grams")]
+    for kw, feeds, words in cases:
+        f = FF(**kw); said = await siri.feed(f, Led(feeds))
+        assert f.fed == [] and words in said, (kw, said)
+    f = FF(); said = await siri.feed(f, None)
+    assert f.fed == [] and "couldn't check" in said
+    print("ok: feed -> 5 + 35; refused when running, asleep, paused, bowl off, fed <20 min ago, over 60 g, no ledger")
+
 asyncio.run(main())
