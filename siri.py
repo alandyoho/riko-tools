@@ -3,6 +3,7 @@ siri.sh. Each command prints ONE short sentence, meant to be spoken back by Siri
 
     siri.sh resume      resume a paused or stopped meal
     siri.sh status      state, power, food and water, last and next meal, bowl
+    siri.sh pause       pause a meal that is preparing (it holds its food until resumed)
 """
 from __future__ import annotations
 
@@ -50,6 +51,27 @@ async def resume(r: Riko) -> str:
             return f"Resumed. The feeder is {st.state.name.lower()} again."
     tip = " A grinder jam usually has to be cleared by hand: take the bowl off first." if code == JAM else ""
     return f"I sent resume, but it's still stopped: {why}.{tip}"
+
+
+async def pause(r: Riko) -> str:
+    st = await r.status()
+    if st.state == FeederState.SERVING:
+        return "It's serving right now. Too late to pause."
+    if st.state == FeederState.SUSPENDED:
+        why = "paused" if st.state_param == 5 else ERROR_CODES.get(st.state_param, f"code {st.state_param}")
+        return f"It's already stopped: {why}. Say resume feeder to continue."
+    if st.state != FeederState.PREPARING:
+        return f"The feeder is {st.state.name.lower().replace('_', ' ')}. There's no meal to pause."
+    await r.feed_control(FeedCtrl.PAUSE)
+    for _ in range(5):
+        await asyncio.sleep(2)
+        st = await r.status()
+        if st.state == FeederState.SUSPENDED:
+            return ("Paused. The meal is holding its food. Say resume feeder to finish it. "
+                    "It will be logged as stopped manually.")
+        if st.state != FeederState.PREPARING:
+            return f"I sent pause, but the feeder is now {st.state.name.lower()}."
+    return "I sent pause, but it's still preparing."
 
 
 def _clock(t: float) -> str:
@@ -112,7 +134,7 @@ async def status(r: Riko, ledger_client=None, device: str = "", owner: int | Non
     return " ".join(parts)
 
 
-COMMANDS = {"resume": resume, "status": status}
+COMMANDS = {"resume": resume, "status": status, "pause": pause}
 
 
 async def main() -> int:

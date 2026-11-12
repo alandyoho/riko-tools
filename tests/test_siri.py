@@ -54,4 +54,15 @@ async def main():
         and said.endswith("Bowl has 11 grams."), said
     print("ok: status ->", said)
 
+    # pause: only a meal that is preparing
+    f = Feeder(1, after=3)
+    said = await siri.pause(f)
+    assert f.sent == [FeedCtrl.PAUSE] and said.startswith("Paused."), said
+    for state, param, words in ((2, 0, "Too late"), (3, 5, "already stopped: paused"), (3, 13, "grinder jammed"),
+                                (0, 0, "idle"), (5, 0, "sleeping")):
+        f = Feeder(state, param)
+        said = await siri.pause(f)
+        assert f.sent == [] and words in said, (state, param, said)
+    print("ok: pause -> only while preparing; serving/stopped/idle/asleep -> nothing sent")
+
 asyncio.run(main())

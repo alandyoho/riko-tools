@@ -62,6 +62,8 @@ log = logging.getLogger("riko.monitor")
 NEVER_RETRY = {10, 11, 13}          # grinder head missing / stalled / jammed
 PUMP_STALL = 70                     # the one we do handle
 BOWL_MISSING = 20                   # the other one we do handle: auto-resume once refilled
+PAUSED = 5                          # a meal paused with feedCtrl PAUSE (app, or siri.sh pause)
+PAUSED_REMIND_MIN = 15.0            # one urgent reminder if it is still paused this long
 BOWL_MISSING_DEBOUNCE_POLLS = 1     # consecutive "bowl is in" reads required before resuming
 FAILOVER_INTERVAL_S = 300           # poll this slowly while on cellular backup (wifi_failover.py)
 
@@ -306,6 +308,8 @@ class Monitor:
         self._served_at: float | None = None   # when the feeder last went to SERVING
         self._battery_st: RikoStatus | None = None   # last status, for the fast battery poll
         self._battery_owed_hint = False    # a battery meal is owed: keep polling fast
+        self._paused_since: float | None = None   # a meal paused on purpose, since when
+        self._paused_reminded = False
         self._battery_clock_wake: float | None = None   # the wake whose clock we last checked
         self._press = switchbot_press.press   # replaced in tests
         self._in_pass = False              # inside check(): the ledger is fetched at most once
@@ -731,6 +735,8 @@ class Monitor:
         if st.state != FeederState.SUSPENDED or st.state_param not in NEVER_RETRY:
             if self._jam is not None:      # that grinder fault is over
                 self._end_jam(st)
+        if not (st.state == FeederState.SUSPENDED and st.state_param == PAUSED):
+            self._paused_since = None
         if st.state == FeederState.SUSPENDED:
             await self._handle_suspension(st)
         elif st.state == FeederState.FAULT:
@@ -980,6 +986,24 @@ class Monitor:
         finally:
             self._bowl_back_count = 0
 
+    def _handle_paused(self, slot: str) -> None:
+        """A meal paused on purpose (siri.sh pause, or the app): one quiet note, and one
+        urgent reminder if it's still paused after PAUSED_REMIND_MIN. It holds its food
+        until resumed (2026-09-30: paused 10 min, then served in full). Used to send an
+        urgent "Feeder suspended: code 5" every pass."""
+        now = time.time()
+        if self._paused_since is None:
+            self._paused_since, self._paused_reminded = now, False
+            log.info("meal paused (slot %s)", slot)
+            self.n.fyi("Meal paused",
+                       f"The {slot} meal is paused and holding its food. Say \"resume feeder\" (or resume "
+                       f"it in the app) to finish it. It will be logged as \"stopped manually\".")
+        elif not self._paused_reminded and now - self._paused_since >= PAUSED_REMIND_MIN * 60:
+            self._paused_reminded = True
+            self.n.action_needed("Meal still paused",
+                                 f"The {slot} meal has been paused for {PAUSED_REMIND_MIN:.0f} minutes. "
+                                 f"Say \"resume feeder\" to serve it.")
+
     async def _handle_suspension(self, st: RikoStatus) -> None:
         code = st.state_param
         name = ERROR_CODES.get(code, f"code {code}")
@@ -990,6 +1014,9 @@ class Monitor:
             return
         if code == BOWL_MISSING:
             await self._handle_bowl_missing_suspension(st, name, slot)
+            return
+        if code == PAUSED:
+            self._handle_paused(slot)
             return
 
         if code != PUMP_STALL:
@@ -1210,9 +1237,15 @@ class Monitor:
                 log.warning("water top-up check failed: %r", exc)
             if f.get("status") == 1:
                 continue  # succeeded
-            new_failures += 1
             reason_str = decode_fail_reason(f.get("fail_reason", ""))
             when = time.strftime("%H:%M", time.localtime(ft))
+            if reason_str == "stopped manually" and (f.get("feed_weight") or 0) > 0:
+                # a paused-then-resumed meal is logged as failed though it was served
+                self.n.fyi(f"{when} meal logged as stopped manually",
+                           f"It was paused and resumed, so the feeder logged it as failed, but it "
+                           f"served {f.get('feed_weight')} g food + {f.get('water_weight')} g water.")
+                continue
+            new_failures += 1
             way = f.get("way", "?")
             plan = f"{f.get('plan_feed_weight')}g food / {f.get('plan_water_weight')}g water"
             got = f"{f.get('feed_weight')}g / {f.get('water_weight')}g"

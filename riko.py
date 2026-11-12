@@ -105,6 +105,7 @@ ERROR_CODES: dict[int, str] = {
     12: "cover missing",
     13: "grinder jammed with food",
     14: "retract-bowl button pressed",
+    15: "cat interference while dispensing food",   # the scale moved mid-dispense
     20: "bowl missing",
     21: "retract-bowl timeout",
     22: "extend-bowl timeout",
@@ -119,8 +120,10 @@ ERROR_CODES: dict[int, str] = {
     60: "overweight",
     61: "weighing chip fault",
     62: "load cell fault",
+    63: "cat interference while weighing",          # new in firmware 1.0.1-0007
     70: "nozzle clogged",
     71: "water pump open circuit",
+    72: "cat interference while dispensing water",
 }
 
 

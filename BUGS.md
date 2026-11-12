@@ -63,6 +63,7 @@ and when rather than deleting it.
     design, but a jam-delayed meal can still end up under-soaked.
 16. **The monitor doesn't know firmware 0007's error code 63** ("cat interference –
     weighing"); it would report it as unknown.
+    *Fixed 2026-11-12: codes 15, 63 and 72 (cat interference) are now named.*
 17. **Deploy drift on the Pi.** ~/riko is an old git checkout updated by copying files, so
     stale files linger (an outdated tests/test_topup.py failed on 11-05).
 18. **The Pi's UPS lasts ~2 hours** and its low-battery safe-idle path has never run on the
