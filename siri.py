@@ -4,12 +4,15 @@ siri.sh. Each command prints ONE short sentence, meant to be spoken back by Siri
     siri.sh resume      resume a paused or stopped meal
     siri.sh status      state, power, food and water, last and next meal, bowl
     siri.sh pause       pause a meal that is preparing (it holds its food until resumed)
-    siri.sh feed        an extra meal at the default amounts (5 g + 35 g), with guards
+    siri.sh feed        an extra meal at the default amounts (5 g + 35 g), with guards;
+                        on battery it wakes the feeder with the SwitchBot first
+    siri.sh wake        press the SwitchBot to wake a sleeping feeder, then fix its clock
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -17,11 +20,39 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from config import load
 from riko import ERROR_CODES, FeedCtrl, FeederState, FoodLevel, Riko, Schedule, WaterLevel
+import switchbot_press
 
 LOG = Path(__file__).resolve().parent / "riko_state" / "siri.log"
 JAM = 13          # grinder jammed with food: resume doesn't clear it (0 of 10, 2026-11-05)
 RECENT_MIN = 20   # "feed" refuses within this long of the last meal - safe to say twice
 DAILY_MAX_G = 60  # same ceiling as the monitor's daily_gram_ceiling
+WAKE_WAIT_S = 60  # after a press, how long to wait for the feeder to come online
+CLOCK_OK_S = 10   # closer than this counts as right
+_press = switchbot_press.press   # replaced in tests
+
+
+def _on_battery(st) -> bool:
+    return (st._p("pwrStatus", {}) or {}).get("pwrType") == 1
+
+
+async def _wake(r: Riko) -> tuple[bool, str]:
+    """Press the SwitchBot on the feed button and wait for the feeder to come online. A press
+    wakes a sleeping feeder without feeding (2026-11-09); on mains it only beeps."""
+    mac = os.environ.get("RIKO_SWITCHBOT_MAC", "")
+    if not mac:
+        return False, "No SwitchBot is set up. Press the feeder's button by hand."
+    res = await _press(mac)
+    if not res.ok:
+        return False, f"The SwitchBot press didn't go through ({res.error or 'no answer'}). Press the button by hand."
+    for _ in range(int(WAKE_WAIT_S / 3)):
+        await asyncio.sleep(3)
+        try:
+            st = await r.status()
+        except Exception:
+            continue
+        if st.state != FeederState.SLEEPING:
+            return True, ""
+    return False, "I pressed the button, but the feeder didn't wake up."
 
 
 def _log(cmd: str, said: str) -> None:
@@ -139,13 +170,11 @@ async def status(r: Riko, ledger_client=None, device: str = "", owner: int | Non
 
 async def feed(r: Riko, ledger_client=None, device: str = "", owner: int | None = None) -> str:
     st = await r.status()
-    if st.state == FeederState.SLEEPING:
-        return "The feeder is asleep on battery and can't take a feed. Press its button once, then try again."
-    if st.state in (FeederState.PREPARING, FeederState.SERVING):
-        return f"It's already {st.state.name.lower()} a meal."
-    if st.state != FeederState.IDLE:
-        why = "paused" if st.state_param == 5 else ERROR_CODES.get(st.state_param, f"code {st.state_param}")
-        return f"The feeder is stopped ({why}). Sort that out first."
+    asleep = st.state == FeederState.SLEEPING
+    if not asleep:
+        busy = _busy(st)
+        if busy:
+            return busy
     if not st.bowl_in:
         return "The bowl is off the tray. Put it back first."
     d = st.default_feed
@@ -173,12 +202,64 @@ async def feed(r: Riko, ledger_client=None, device: str = "", owner: int | None 
     if fed_today + still_planned + food > DAILY_MAX_G:
         return (f"That would put today over {DAILY_MAX_G} grams: {_g(fed_today)} so far and "
                 f"{_g(still_planned)} still scheduled. I didn't feed.")
+    woke = ""
+    if asleep:                                # on battery: wake it with the SwitchBot first
+        ok, msg = await _wake(r)
+        if not ok:
+            return msg + " I didn't feed."
+        st = await r.status()
+        if st.state == FeederState.PREPARING:
+            return "I woke it, and it started a meal by itself."
+        busy = _busy(st)
+        if busy:
+            return "I woke it, but " + busy[0].lower() + busy[1:]
+        woke = "I woke it with the SwitchBot. "
     await r.feed(food, water)
-    ready = _clock(now + (d.soak_min or 10) * 60 + 30)
-    return f"Feeding {_g(food)} grams with {_g(water)} of water. It'll be ready around {ready}."
+    soak = 6.5 if _on_battery(st) else (d.soak_min or 10) + 0.5     # manual feeds soak ~6 min on battery
+    return f"{woke}Feeding {_g(food)} grams with {_g(water)} of water. It'll be ready around {_clock(now + soak * 60)}."
 
 
-COMMANDS = {"resume": resume, "status": status, "pause": pause, "feed": feed}
+def _busy(st) -> str:
+    """Why the feeder can't take a feed right now, or "" if it can."""
+    if st.state in (FeederState.PREPARING, FeederState.SERVING):
+        return f"It's already {st.state.name.lower()} a meal."
+    if st.state != FeederState.IDLE:
+        why = "paused" if st.state_param == 5 else ERROR_CODES.get(st.state_param, f"code {st.state_param}")
+        return f"The feeder is stopped ({why}). Sort that out first."
+    return ""
+
+
+async def wake(r: Riko) -> str:
+    st = await r.status()
+    said = []
+    if st.state == FeederState.SLEEPING:
+        ok, msg = await _wake(r)
+        if not ok:
+            return msg
+        said.append("Awake.")
+        st = await r.status()
+    else:
+        said.append("It's already awake.")
+    if st.state == FeederState.IDLE:          # never touch the clock mid-meal
+        try:
+            d = await asyncio.wait_for(r.device_time(), 10)
+            drift = d - time.time()
+            if abs(drift) < CLOCK_OK_S:
+                said.append("Its clock is right.")
+            else:
+                await r.sync_time()
+                how = f"{abs(drift) / 60:.0f} minutes" if abs(drift) >= 90 else f"{abs(drift):.0f} seconds"
+                said.append(f"Its clock was {how} {'fast' if drift > 0 else 'slow'}, so I synced it.")
+        except Exception:
+            said.append("I couldn't read its clock.")
+    elif st.state in (FeederState.PREPARING, FeederState.SERVING):
+        said.append(f"It's {st.state.name.lower()} a meal, so I left the clock alone.")
+    if _on_battery(st):
+        said.append("It's on battery and will sleep again in about a minute.")
+    return " ".join(said)
+
+
+COMMANDS = {"resume": resume, "status": status, "pause": pause, "feed": feed, "wake": wake}
 
 
 async def main() -> int:

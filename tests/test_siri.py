@@ -83,7 +83,7 @@ async def main():
     lt = T.localtime(now); midnight = now - (lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec)
     f = FF(); said = await siri.feed(f, Led([{"feed_time": now - 3600, "feed_weight": 5}]))
     assert f.fed == [(5, 35)] and said.startswith("Feeding 5 grams with 35 of water."), said
-    cases = [(dict(state=1), [], "already preparing"), (dict(state=5), [], "asleep"),
+    cases = [(dict(state=1), [], "already preparing"), (dict(state=5), [], "No SwitchBot"),
              (dict(state=3, param=5), [], "stopped (paused)"), (dict(bowl_off=True), [], "bowl is off"),
              (dict(), [{"feed_time": now - 600, "feed_weight": 5}], "under 20 minutes ago"),
              (dict(), [{"feed_time": midnight + 60, "feed_weight": 57}], "over 60 grams")]
@@ -93,5 +93,53 @@ async def main():
     f = FF(); said = await siri.feed(f, None)
     assert f.fed == [] and "couldn't check" in said
     print("ok: feed -> 5 + 35; refused when running, asleep, paused, bowl off, fed <20 min ago, over 60 g, no ledger")
+
+    # the SwitchBot: a press wakes a sleeping feeder (state 5 -> 0)
+    import os
+    os.environ["RIKO_SWITCHBOT_MAC"] = "AA:BB:CC:DD:EE:FF"
+    def bot(f, ok=True, wakes=True, to=0):
+        presses = []
+        async def press(mac):
+            presses.append(mac)
+            if ok and wakes: f.p["state"] = to
+            return siri.switchbot_press.PressResult(ok, 1, 7.0, 100, -55, "" if ok else "not seen in the scan")
+        siri._press = press
+        return presses
+    class W(FF):
+        async def device_time(self): return T.time() + self.p.get("drift", 0)
+        async def sync_time(self): self.p["synced"] = True; self.p["drift"] = 0
+
+    # feed on battery, asleep -> press, wake, feed (soak ~6 min on battery)
+    f = W(state=5, pwr=1); presses = bot(f)
+    said = await siri.feed(f, Led([]))
+    assert presses and f.fed == [(5, 35)] and said.startswith("I woke it with the SwitchBot. Feeding 5 grams"), said
+    # ...the guards still come first: fed 10 min ago -> no press at all
+    f = W(state=5, pwr=1); presses = bot(f)
+    said = await siri.feed(f, Led([{"feed_time": now - 600, "feed_weight": 5}]))
+    assert not presses and f.fed == [] and "under 20 minutes" in said, said
+    # ...press fails / doesn't wake / it starts its own meal on waking
+    for kw, words, fed in ((dict(ok=False), "didn't go through", []), (dict(wakes=False), "didn't wake up", []),
+                           (dict(to=1), "started a meal by itself", [])):
+        f = W(state=5, pwr=1); bot(f, **kw)
+        said = await siri.feed(f, Led([]))
+        assert f.fed == fed and words in said, (kw, said)
+    os.environ.pop("RIKO_SWITCHBOT_MAC")
+    f = W(state=5, pwr=1); said = await siri.feed(f, Led([]))
+    assert f.fed == [] and "No SwitchBot" in said, said
+    os.environ["RIKO_SWITCHBOT_MAC"] = "AA:BB:CC:DD:EE:FF"
+    print("ok: feed on battery -> SwitchBot wake then feed; guards before any press; press failures reported")
+
+    # wake: press if asleep, then fix the clock (never mid-meal)
+    f = W(state=5, pwr=1, drift=-15 * 60); presses = bot(f)
+    said = await siri.wake(f)
+    assert presses and f.p.get("synced") and said == ("Awake. Its clock was 15 minutes slow, so I synced it. "
+                                                     "It's on battery and will sleep again in about a minute."), said
+    f = W(state=0, drift=3); presses = bot(f)
+    said = await siri.wake(f)
+    assert not presses and not f.p.get("synced") and said == "It's already awake. Its clock is right.", said
+    f = W(state=1, drift=600); presses = bot(f)
+    said = await siri.wake(f)
+    assert not f.p.get("synced") and "left the clock alone" in said, said
+    print("ok: wake ->", "press + clock sync; already awake; mid-meal leaves the clock")
 
 asyncio.run(main())
