@@ -6,7 +6,7 @@ import siri
 from riko import FeedCtrl, RikoStatus
 
 async def nosleep(s): pass
-siri.asyncio = type("A", (), {"sleep": staticmethod(nosleep)})
+siri.asyncio = type("A", (), {"sleep": staticmethod(nosleep), "wait_for": staticmethod(asyncio.wait_for)})
 
 class Feeder:
     def __init__(self, state, param=0, after=None):
@@ -29,5 +29,29 @@ async def main():
         said = await siri.resume(f)
         assert f.sent == [] and words in said, (state, said)
     print("ok: paused -> resumed; jam -> sent, still stopped + hand-clear tip; idle/asleep/running/fault -> nothing sent")
+
+    # status: the sentence Siri reads
+    import json
+    class S:
+        def __init__(self, **p): self.p = p
+        async def status(self):
+            raw = {"deviceState": {"value": {"state": self.p.get("state", 0), "param": self.p.get("param", 0)}},
+                   "pwrStatus": {"value": {"pwrType": self.p.get("pwr", 0), "batPercentage": 85}},
+                   "foodLvl": {"value": self.p.get("food", 2)}, "waterLvl": {"value": self.p.get("water", 4)},
+                   "fdPlanStr": {"value": json.dumps({"bEn": [1], "bDayEn": [1], "time": [0], "rept": [127],
+                                                       "food": [5], "water": [35], "aud": [2], "type": [1]})}}
+            return RikoStatus(raw)
+        async def live_scale(self):
+            if self.p.get("scale") == "off": return 2.0, 68
+            return 68 + self.p.get("bowl", 0), 68
+    said = await siri.status(S())
+    assert said.startswith("Idle, on mains. Food and water OK.") and "Next 12:00 AM, 5 grams." in said \
+        and said.endswith("Bowl is empty."), said
+    said = await siri.status(S(state=5, pwr=1, water=1))
+    assert said.startswith("Sleeping, on battery at 85 percent. Heads up: water is very low.") and "Bowl" not in said, said
+    said = await siri.status(S(state=3, param=13, food=1, bowl=11))
+    assert said.startswith("Stopped: grinder jammed with food, on mains. Heads up: food is low.") \
+        and said.endswith("Bowl has 11 grams."), said
+    print("ok: status ->", said)
 
 asyncio.run(main())

@@ -2,6 +2,7 @@
 siri.sh. Each command prints ONE short sentence, meant to be spoken back by Siri.
 
     siri.sh resume      resume a paused or stopped meal
+    siri.sh status      state, power, food and water, last and next meal, bowl
 """
 from __future__ import annotations
 
@@ -13,7 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from config import load
-from riko import ERROR_CODES, FeedCtrl, FeederState, Riko
+from riko import ERROR_CODES, FeedCtrl, FeederState, FoodLevel, Riko, Schedule, WaterLevel
 
 LOG = Path(__file__).resolve().parent / "riko_state" / "siri.log"
 JAM = 13          # grinder jammed with food: resume doesn't clear it (0 of 10, 2026-11-05)
@@ -51,7 +52,67 @@ async def resume(r: Riko) -> str:
     return f"I sent resume, but it's still stopped: {why}.{tip}"
 
 
-COMMANDS = {"resume": resume}
+def _clock(t: float) -> str:
+    """3:55 PM - reads naturally."""
+    return time.strftime("%I:%M %p", time.localtime(t)).lstrip("0")
+
+
+def _g(x: float) -> str:
+    return f"{x:g}"
+
+
+async def status(r: Riko, ledger_client=None, device: str = "", owner: int | None = None) -> str:
+    st = await r.status()
+    parts = []
+    if st.state == FeederState.SUSPENDED:
+        parts.append(f"Stopped: {ERROR_CODES.get(st.state_param, f'code {st.state_param}')}.")
+    elif st.state == FeederState.FAULT:
+        parts.append(f"Fault: {ERROR_CODES.get(st.state_param, f'code {st.state_param}')}.")
+    else:
+        parts.append(st.state.name.lower().replace("_", " ").capitalize()
+                     .replace("Freshness protect", "Bowl pulled in for freshness") + ",")
+    pwr = (st._p("pwrStatus", {}) or {})
+    parts[-1] = parts[-1].rstrip(",.") + (f", on battery at {st.battery_pct} percent." if pwr.get("pwrType") == 1
+                                          else ", on mains.")
+    food, water = st.food_level, st.water_level
+    lv = []
+    if food in (FoodLevel.EMPTY, FoodLevel.INSUFFICIENT):
+        lv.append(f"food is {'empty' if food == FoodLevel.EMPTY else 'low'}")
+    if water in (WaterLevel.EMPTY, WaterLevel.INSUFFICIENT, WaterLevel.LOW):
+        lv.append(f"water is {water.name.lower().replace('insufficient', 'very low')}")
+    parts.append(("Heads up: " + " and ".join(lv) + ".") if lv else "Food and water OK.")
+
+    if ledger_client is not None:
+        try:
+            led = await ledger_client.ledger(device, days=1, owner_user_id=owner)
+            ok = [f for f in led.get("feed_list", []) if f.get("status") == 1 and (f.get("feed_weight") or 0) > 0]
+            if ok:
+                f = max(ok, key=lambda x: x["feed_time"])
+                parts.append(f"Last meal {_clock(f['feed_time'])}, {_g(f['feed_weight'])} grams.")
+        except Exception:
+            pass
+    sched = Schedule.from_status(st)
+    if sched:
+        lt = time.localtime()
+        now = lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec
+        ahead = sorted(((sl.seconds_from_midnight - now) % 86400, sl) for _, sl in sched.active_today())
+        if ahead:
+            secs, sl = ahead[0]
+            parts.append(f"Next {_clock(time.time() + secs)}, {_g(sl.food_g)} grams.")
+    if st.state != FeederState.SLEEPING:
+        try:
+            gram, bowl = await asyncio.wait_for(r.live_scale(), 10)
+            if gram > bowl / 2:
+                left = max(0.0, gram - bowl)
+                parts.append("Bowl is empty." if left < 1.5 else f"Bowl has {left:.0f} grams.")
+            else:
+                parts.append("The bowl is off.")
+        except Exception:
+            pass
+    return " ".join(parts)
+
+
+COMMANDS = {"resume": resume, "status": status}
 
 
 async def main() -> int:
@@ -63,7 +124,16 @@ async def main() -> int:
     try:
         async with Riko.from_config(load()) as r:
             r.relogin = r.login               # share the account's one session with the monitor
-            said = await COMMANDS[cmd](r)
+            if cmd == "status":
+                cfg = load()
+                owner = getattr(cfg, "feeder_owner_id", 0) or None
+                led = None
+                if owner:
+                    from neakasa import Feeder as NeakasaFeeder
+                    led = NeakasaFeeder(client=r.client)
+                said = await status(r, led, r.device.device_name, owner)
+            else:
+                said = await COMMANDS[cmd](r)
     except Exception as exc:
         msg = str(exc)
         said = ("The feeder isn't answering. It may be asleep on battery or offline."
