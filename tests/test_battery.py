@@ -203,7 +203,7 @@ async def main():
     print("J ok:", notes[-1][1])
 
     # ---- the SwitchBot on the feed button
-    BOT = dict(switchbot=True, switchbot_mac="E6:55:81:C6:64:73")
+    BOT = dict(switchbot=True, switchbot_mac="AA:BB:CC:DD:EE:FF")
     def bot(mon, f, ok=True, wakes=True, battery=100):
         presses = []
         async def press(mac):
