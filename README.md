@@ -326,6 +326,15 @@ grinder jam.
   one. One meal at a time, once per meal, within the daily ceiling, never while it is
   preparing; the kill switch turns it into an alert.
 
+- **With a SwitchBot Bot on the feed button** (`switchbot_press.py`, Bluetooth straight
+  from the Pi, no hub or internet), the monitor can make the wake happen itself. If a
+  battery meal is still owed a minute after its slot and the feeder is asleep (the cloud
+  says so and it doesn't answer directly), it presses the button, waits up to 90 s for
+  the feeder to come online, then syncs the clock and sends the meal as above. A second
+  press 7 minutes later if needed, then an alert to do it by hand; a low-battery alert
+  for the Bot at 20%. A press wakes a sleeping feeder without feeding; on mains it only
+  beeps. Off unless `RIKO_SWITCHBOT=on` and `RIKO_SWITCHBOT_MAC` are set in `.env`.
+
 Every jam is logged (table `jams` in `monitor.db`): the bowl's weight while stuck and
 how it ended — cleared by the monitor, cleared by hand, or timed out. Other grinder
 faults (head missing, motor stalled) are never retried.

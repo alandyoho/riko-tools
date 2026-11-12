@@ -53,6 +53,8 @@ and when rather than deleting it.
     *Proven live 2026-11-11 13:55: woke 13:47:23, clock synced, meal sent 13:47:31, served
     13:52:46, no help. Side effect, still open: the feeder's own attempt at that meal
     (13:48:00) was rejected "device busy" and raised a false urgent "Feed failed" alert.*
+    *SwitchBot fallback built 2026-11-11 (off until tested on battery): presses the feed
+    button at slot + 1 min when the meal is still owed and the feeder is asleep.*
 14. **A manual feed can hide a missed meal.** The missed-meal check counts any feed within
     ~11 minutes of the slot as that meal's record (how the 11-09 15:55 miss went unalerted).
     The reverse is fixed (2026-11-11): a meal the monitor saw preparing or serving isn't

@@ -31,7 +31,9 @@ class Feeder:
     async def feed(self, f, w=None, **k):
         if self.feed_fails: raise RuntimeError("20056")
         self.feeds.append((f, w))
-    async def device_time(self): return clock["now"] + self.fast
+    async def device_time(self):
+        if self.state == 5: raise TimeoutError("asleep")       # unreachable while it sleeps
+        return clock["now"] + self.fast
     async def sync_time(self, source=1): self.syncs.append(clock["now"]); self.fast = 0.0
 
 class Ledger:
@@ -41,12 +43,12 @@ class Ledger:
         self.feeds.append({"feed_time": int(real.mktime((2026, 11, 9, h, m, 7, 0, 0, -1))), "status": 1,
                            "way": way, "feed_weight": 5, "water_weight": 34})
 
-def make(kill=False):
+def make(kill=False, **pol):
     d = Path(tempfile.mkdtemp()); f, led, notes = Feeder(), Ledger(), []
     n = types.SimpleNamespace(action_needed=lambda t, b: notes.append(("ACT", t, b)) or True,
                               fyi=lambda t, b: notes.append(("FYI", t, b)) or True)
     if kill: (d / "KILL").touch()
-    mon = M.Monitor(f, M.Store(d / "m.db"), n, M.Policy(killswitch=d / "KILL"), 0, False,
+    mon = M.Monitor(f, M.Store(d / "m.db"), n, M.Policy(killswitch=d / "KILL", **pol), 0, False,
                     neakasa=led, device_name="dev")
     async def wait(s):                               # the confirm wait: time passes, the feeder may move
         clock["now"] += s
@@ -199,5 +201,56 @@ async def main():
     await mon._check_missed_meal(await f.status())
     assert notes[-1][1] == "19:55 meal hasn't run — feeder on battery" and "feed button ONCE" in notes[-1][2], notes
     print("J ok:", notes[-1][1])
+
+    # ---- the SwitchBot on the feed button
+    BOT = dict(switchbot=True, switchbot_mac="E6:55:81:C6:64:73")
+    def bot(mon, f, ok=True, wakes=True, battery=100):
+        presses = []
+        async def press(mac):
+            presses.append(real.strftime("%H:%M", real.localtime(clock["now"])))
+            if ok and wakes: f.state = 0                    # a press wakes it, idle
+            return M.switchbot_press.PressResult(ok, 1, 7.0, battery, -55, "" if ok else "not seen in the scan")
+        mon._press = press
+        return presses
+
+    # P. 19:55 skipped and its wake missed: at 19:56 (asleep, owed) -> press -> awake -> clock + meal
+    mon, f, led, notes = make(**BOT); presses = bot(mon, f)
+    await unplug(mon, f, 19, 31)
+    at(19, 55, 30); await mon.battery_tick(); assert presses == [], "not before slot + 1 min"
+    at(19, 56, 5); f.fast = 15 * 60; await mon.battery_tick()
+    assert presses == ["19:56"] and f.feeds == [(5, 35)] and len(f.syncs) == 1, (presses, f.feeds, f.syncs)
+    at(19, 58); f.state = 5; await mon.battery_tick(); assert presses == ["19:56"], "meal done: no more presses"
+    print("P ok: missed wake -> SwitchBot press at 19:56 -> awake -> clock synced, 19:55 meal sent")
+
+    # Q. a press that fails: a note, a second press 7 min later, then one alert to do it by hand
+    mon, f, led, notes = make(**BOT); presses = bot(mon, f, ok=False)
+    await unplug(mon, f, 19, 31)
+    for hh, mm in ((19, 56), (19, 58), (20, 3), (20, 5), (20, 20)):
+        at(hh, mm); await mon.battery_tick()
+    assert presses == ["19:56", "20:03"] and f.feeds == [], presses
+    titles = [n[1] for n in notes]
+    assert titles.count("SwitchBot press failed") == 1 and titles.count("19:55 meal: couldn't wake the feeder") == 1, titles
+    print("Q ok: failed presses -> 2 tries 7 min apart, one note, one 'couldn't wake' alert")
+
+    # R. never pressed: switchbot off, kill switch, feeder answers (awake), meal expired, or not owed
+    for kw, setup, when in ((dict(), None, (19, 57)), (dict(BOT, kill=True), None, (19, 57)),
+                            (BOT, "awake", (19, 57)), (BOT, None, (21, 50)), (BOT, "record", (19, 57))):
+        mon, f, led, notes = make(**kw); presses = bot(mon, f)
+        await unplug(mon, f, 19, 31)
+        if setup == "record": led.add(19, 55)
+        at(*when)
+        if setup == "awake":
+            async def answers(): return clock["now"]
+            f.device_time = answers
+        await mon.battery_tick()
+        assert presses == [], (kw, setup, when, presses)
+    print("R ok: no press when off, kill switch, feeder answers, meal expired, or it already ran")
+
+    # S. the Bot's battery: one alert at or below 20%
+    mon, f, led, notes = make(**BOT); presses = bot(mon, f, battery=15)
+    await unplug(mon, f, 19, 31)
+    at(19, 57); await mon.battery_tick()
+    assert [n[1] for n in notes].count("SwitchBot battery low") == 1
+    print("S ok: low SwitchBot battery -> one alert")
 
 asyncio.run(main())

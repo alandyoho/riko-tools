@@ -53,6 +53,7 @@ from riko import (ERROR_CODES, FeedCtrl, FeederState, FoodLevel, Riko, RikoStatu
                   WaterLevel)
 from neakasa import Feeder as NeakasaFeeder
 import power
+import switchbot_press
 import topup
 
 log = logging.getLogger("riko.monitor")
@@ -182,6 +183,15 @@ class Policy:
     battery_rescue_max_age_h: float = 3.0   # don't send a meal older than this
     battery_rescue_max_meals: int = 1       # never two meals at once (vomiting history)
     battery_owed_poll_cellular_s: float = 20.0   # waiting for a button press, over cellular
+    # SwitchBot Bot on the feed button (switchbot_press.py): wakes the sleeping feeder when
+    # its own pre-meal wake was missed. Off until it's proven on battery (RIKO_SWITCHBOT=on).
+    switchbot: bool = False
+    switchbot_mac: str = ""
+    switchbot_press_after_min: float = 1.0  # press this long after the slot if the meal is still owed
+    switchbot_retry_after_min: float = 7.0  # second press this long after the first
+    switchbot_max_presses: int = 2          # per meal; then it's the owner's
+    switchbot_wake_wait_s: float = 90.0     # how long to wait for it to come online after a press
+    switchbot_battery_low: int = 20         # % - alert once at or below
     killswitch: Path = field(default_factory=lambda: Path("riko_state/DISABLE_REMEDIATION"))
 
 
@@ -297,6 +307,7 @@ class Monitor:
         self._battery_st: RikoStatus | None = None   # last status, for the fast battery poll
         self._battery_owed_hint = False    # a battery meal is owed: keep polling fast
         self._battery_clock_wake: float | None = None   # the wake whose clock we last checked
+        self._press = switchbot_press.press   # replaced in tests
         self._in_pass = False              # inside check(): the ledger is fetched at most once
         self._pass_ledger: dict | None = None
         self._pass_ledger_failed = False
@@ -404,6 +415,7 @@ class Monitor:
         try:
             self._check_feeder_power(st)
             await self._battery_rescue(st)
+            await self._battery_press(st)
         except Exception as exc:
             log.warning("feeder battery check failed: %r", exc)
         await self._check_clock(st)
@@ -1583,6 +1595,7 @@ class Monitor:
         if st.state == FeederState.SERVING and (self._served_at is None or time.time() - self._served_at > 600):
             self._served_at = time.time()
         await self._battery_rescue(st)
+        await self._battery_press(st)
 
     def _battery_seen(self) -> list[str]:
         raw = self.store.get_setting("battery_meals_done")
@@ -1753,6 +1766,106 @@ class Monitor:
                    f"feed (it soaks ~6 min on battery).")
 
 
+    # ---- the SwitchBot on the feed button ----------------------------------------
+    def _press_log(self) -> dict:
+        raw = self.store.get_setting("switchbot_presses")
+        try:
+            return json.loads(raw) if raw else {}
+        except ValueError:
+            return {}
+
+    async def _battery_press(self, st: RikoStatus) -> None:
+        """Wake the sleeping feeder with the SwitchBot when a battery meal is still owed.
+
+        The rescue (_battery_rescue) needs the feeder awake. Normally it wakes by itself
+        ~7 min before the slot; if that moment was missed (or the feed didn't go through),
+        then from switchbot_press_after_min after the slot, while the meal is still owed
+        (until the next meal's prep), press the feed button - a press wakes it without
+        feeding, and on mains it only beeps (2026-11-11) - wait for it to come online,
+        and hand over to _battery_rescue, which syncs the clock and sends the meal.
+        Only when the cloud says it is asleep AND it doesn't answer directly, at most
+        switchbot_max_presses per meal, switchbot_retry_after_min apart; the kill switch
+        and dry run block it. When the presses are used up, alert."""
+        p = self.p
+        if not (p.switchbot and p.switchbot_mac and p.battery_rescue) or not _on_battery(st):
+            return
+        if st.state != FeederState.SLEEPING:
+            return
+        now, done, presses = time.time(), self._battery_seen(), self._press_log()
+        since_raw = self.store.get_setting("feeder_battery_since")
+        if not since_raw:
+            return
+        # cheap pre-check before reading the ledger: a meal past its press time, not done
+        cand = [(due, sl, key) for due, sl, key in self._slot_occurrences(st)
+                if due + p.switchbot_press_after_min * 60 <= now and key not in done
+                and float(since_raw) <= due - 10 * 60]
+        if not cand:
+            return
+        try:
+            ledger = await self._get_ledger() if self.neakasa is not None else None
+        except Exception:
+            ledger = None
+        owed = [o for o in self._owed_meals(st, ledger) if o[0] + p.switchbot_press_after_min * 60 <= now]
+        if not owed:
+            return
+        due, sl, key = owed[-1]
+        tries = presses.get(key, [])
+        if len(tries) >= p.switchbot_max_presses:
+            if self.store.get_setting("switchbot_gave_up") != key:
+                self.store.put_setting("switchbot_gave_up", key)
+                self.n.action_needed(f"{sl.hhmm} meal: couldn't wake the feeder",
+                                     f"The feeder is on battery and asleep, and the {sl.hhmm} meal hasn't run. "
+                                     f"The SwitchBot pressed its button {len(tries)} times without waking it "
+                                     f"enough to feed. Press the feed button by hand (the monitor sends the "
+                                     f"meal when it wakes), or plug it back in.")
+            return
+        if tries and now - tries[-1] < p.switchbot_retry_after_min * 60:
+            return
+        if self.dry_run or p.killswitch.exists():
+            log.info("switchbot: would press for the %s meal, but %s", sl.hhmm,
+                     "dry-run" if self.dry_run else "the kill switch is set")
+            return
+        try:                                        # asleep for real? an awake feeder answers
+            await asyncio.wait_for(self.r.device_time(), 10)
+            log.info("switchbot: the feeder answers - not pressing")
+            return
+        except Exception:
+            pass
+        presses[key] = tries + [now]
+        self.store.put_setting("switchbot_presses", json.dumps(dict(list(presses.items())[-20:])))
+        res = await self._press(p.switchbot_mac)
+        self.store.record_remediation(sl.hhmm, "switchbot_press",
+                                      f"{'ok' if res.ok else 'FAILED'} in {res.seconds:.0f}s, {res.attempts} tries, "
+                                      f"rssi {res.rssi}, battery {res.battery}% {res.error}".strip())
+        log.warning("switchbot: press for the %s meal: %s (%d tries, %.0fs, battery %s%%)",
+                    sl.hhmm, "ok" if res.ok else "FAILED " + res.error, res.attempts, res.seconds, res.battery)
+        if res.battery is not None and res.battery <= p.switchbot_battery_low \
+                and self.store.get_setting("switchbot_battery_alerted") != str(res.battery // 10):
+            self.store.put_setting("switchbot_battery_alerted", str(res.battery // 10))
+            self.n.action_needed("SwitchBot battery low",
+                                 f"The SwitchBot on the feed button is at {res.battery}%. Replace its CR2 cell.")
+        if not res.ok:
+            if len(presses[key]) == 1:
+                self.n.fyi("SwitchBot press failed",
+                           f"Tried to wake the feeder for the {sl.hhmm} meal but the press didn't go "
+                           f"through ({res.error or 'no answer'}). Trying again in "
+                           f"{p.switchbot_retry_after_min:.0f} min.")
+            return
+        end = time.time() + p.switchbot_wake_wait_s
+        while time.time() < end:
+            await self._sleep(3)
+            try:
+                st2 = await self.r.status()
+            except Exception:
+                continue
+            if st2.state != FeederState.SLEEPING:
+                log.info("switchbot: feeder awake (%s) after the press", st2.state.name)
+                self._battery_st = st2
+                await self._battery_rescue(st2)
+                return
+        log.warning("switchbot: pressed, but the feeder didn't come online in %.0fs", p.switchbot_wake_wait_s)
+
+
 # ---- slot math (planned intake + which slot we're in) ----------------------
 def _fmt(value: Any) -> str:
     """Stable string form of a setting, so trivial dict ordering doesn't look like drift."""
@@ -1828,7 +1941,9 @@ async def main() -> int:
     notifier = Notifier(NotifyConfig.from_sources(cfg))
     store = Store(cfg.state_dir / "monitor.db")
     policy = Policy(killswitch=cfg.state_dir / "DISABLE_REMEDIATION",
-                    topup_mode=os.environ.get("RIKO_TOPUP", "observe").lower())
+                    topup_mode=os.environ.get("RIKO_TOPUP", "observe").lower(),
+                    switchbot=os.environ.get("RIKO_SWITCHBOT", "off").lower() == "on",
+                    switchbot_mac=os.environ.get("RIKO_SWITCHBOT_MAC", ""))
 
     async with Riko.from_config(cfg) as r:
         neakasa_client = None
@@ -1849,8 +1964,9 @@ async def main() -> int:
         if args.once:
             await mon.check()
             return 0
-        log.info("monitor running, %.0fs interval; top-up %s", args.interval,
-                 policy.topup_mode if neakasa_client else "off (needs the ledger)")
+        log.info("monitor running, %.0fs interval; top-up %s; switchbot %s", args.interval,
+                 policy.topup_mode if neakasa_client else "off (needs the ledger)",
+                 "on" if policy.switchbot and policy.switchbot_mac else "off")
         failover_flag = cfg.state_dir / "FAILOVER"   # set by wifi_failover.py during a takeover
         next_full = 0.0
         while True:
