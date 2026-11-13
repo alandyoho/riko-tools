@@ -322,6 +322,22 @@ manual feeding will not be available".
   50 s off, but ~7 s after waking, and the clock has been seen correcting itself just
   after a wake. **Test (armed for 11-11 15:55):** sync the clock at the wake and send
   nothing; does it run its own meal (full 10-min soak)?
+- **2026-11-12 19:55 — the wake-sync test (monitor kill switch on): it ran its own first
+  meal.** Feeder rebooted 19:19 (to clear a stuck LED animation), unplugged 19:25:05
+  (90%), asleep 19:25:59. Woke 19:47:31 IDLE, clock **+21 s**; `updateTime` sent at once,
+  clock after +22 s (nothing to fix). PREPARING at 19:48:01, 29 s after the sync, with
+  nothing else sent; served 19:55:02 (on time), asleep 19:55:45. First of 7 first-meals on
+  battery to run on its own. **Reading:** not the clock value - 11-09 19:47 woke only 50 s
+  off and still skipped. What 11-11 13:47 and tonight share is a sync command right at the
+  wake, then the feeder's own meal attempt 29-36 s later; the six skips had nothing sent.
+  So: **a sync at wake seems to make it re-check its schedule.** The monitor's
+  `_battery_clock` already syncs once per wake, but only when the clock is off; if this
+  holds, sync at every pre-meal wake regardless. Confound: the reboot 35 min before. One
+  clean repeat (no reboot, clock near right, sync at wake) would settle it.
+- **2026-11-12 19:56 — SwitchBot wake on battery, live: worked.** `siri.wake` from the Pi
+  while asleep: awake (IDLE) 20 s after the command (Bluetooth scan + press + cloud
+  report), clock right, asleep again 19:57:07 - **~37 s awake per press**, the same as
+  after switching to battery. Enough to send a feed.
 - **Follow-ups:** the open question above (SwitchBot wake: now the only rescue found);
   does the first meal fail if the cut starts during the 10-minute prep, or within a few
   minutes of the slot; the monitor's clock hold should not protect a meal whose slot

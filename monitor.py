@@ -1245,6 +1245,16 @@ class Monitor:
                            f"It was paused and resumed, so the feeder logged it as failed, but it "
                            f"served {f.get('feed_weight')} g food + {f.get('water_weight')} g water.")
                 continue
+            other = self._busy_with_another_meal(f, ledger, st)
+            if other:
+                # a meal was already under way (the rescue's feed, a manual one): the
+                # feeder turned away its own try at the same meal - one meal, not a failure
+                self.n.fyi(f"{when} meal: duplicate turned away",
+                           f"The feeder's own try at the {when} meal was refused because {other} "
+                           f"was already running. He got one meal, as intended.")
+                log.info("ledger: %s %s feed refused as busy while %s - not a failure",
+                         when, f.get("way", "?"), other)
+                continue
             new_failures += 1
             way = f.get("way", "?")
             plan = f"{f.get('plan_feed_weight')}g food / {f.get('plan_water_weight')}g water"
@@ -1264,6 +1274,34 @@ class Monitor:
 
         if newest > last_seen:
             self.store.put_setting("ledger_last_feed_time", str(newest))
+
+    @staticmethod
+    def _busy_with_another_meal(f: dict, ledger: dict, st: RikoStatus) -> str:
+        """For a feed refused as "device busy" while preparing or serving (reason 4,
+        resParam 1/2): the other meal that kept it busy, or "" if there is no sign of one.
+
+        On 2026-11-11 the battery rescue sent the 13:55 meal at 13:47:31; at 13:48:00 the
+        feeder tried its own 13:55 meal, was refused "busy (FoodPreparing)" and that went
+        into the ledger as a failed auto feed - a false urgent "Feed failed". Evidence of
+        the other meal: another ledger feed that delivered food within 15 minutes, or the
+        feeder preparing/serving right now (the ledger record of a feed only appears once
+        it is served). With neither, the refusal stays a real failure (a stuck state)."""
+        try:
+            d = json.loads(f.get("fail_reason") or "{}")
+        except (ValueError, TypeError):
+            return ""
+        if d.get("reason") != 4 or d.get("resParam") not in (1, 2):
+            return ""
+        ft = f.get("feed_time", 0)
+        for g in ledger.get("feed_list", []):
+            if g is f or (g.get("feed_weight") or 0) <= 0:
+                continue
+            if abs((g.get("feed_time") or 0) - ft) <= 15 * 60:
+                when = time.strftime("%H:%M", time.localtime(g["feed_time"]))
+                return f"a {g.get('way', '?')} feed (served {when})"
+        if st.state in (FeederState.PREPARING, FeederState.SERVING) and time.time() - ft < 15 * 60:
+            return "another feed"
+        return ""
 
     async def _check_water_short(self, st: RikoStatus, feed: dict) -> None:
         """Add the water a meal was served without, as a water-only manual feed.

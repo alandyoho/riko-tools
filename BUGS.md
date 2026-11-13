@@ -55,6 +55,11 @@ and when rather than deleting it.
     (13:48:00) was rejected "device busy" and raised a false urgent "Feed failed" alert.*
     *SwitchBot fallback built 2026-11-11 (off until tested on battery): presses the feed
     button at slot + 1 min when the meal is still owed and the feeder is asleep.*
+    *2026-11-12: the SwitchBot wake proven live on battery (awake 20 s after the command,
+    ~37 s up); turned on in the monitor (RIKO_SWITCHBOT=on). The false "device busy"
+    alert fixed: a refusal "busy (FoodPreparing/FoodDelivering)" with another feed served
+    within 15 min, or the feeder preparing/serving right now, is a "duplicate turned away"
+    note; with no other meal in sight it is still a "Feed failed" alert (tests/test_busy.py).*
 14. **A manual feed can hide a missed meal.** The missed-meal check counts any feed within
     ~11 minutes of the slot as that meal's record (how the 11-09 15:55 miss went unalerted).
     The reverse is fixed (2026-11-11): a meal the monitor saw preparing or serving isn't
