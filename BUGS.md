@@ -82,6 +82,9 @@ and when rather than deleting it.
 19. **The Pi keeps only about a day of system logs** (on 11-11 the oldest monitor entry was
     11-10 21:47), so incidents have to be read within a day; riko_capture/pushes.jsonl and
     monitor.db are the long-term record.
+    *Fixed 2026-11-12: the journal is on disk now (Pi OS keeps it in RAM by default),
+    capped at 250 MB with 1 GB kept free: /etc/systemd/journald.conf.d/50-riko-persistent.conf.
+    About a month at ~8 MB/day; it survives reboots.*
 20. **Cellular "relay" mode (router up, internet down) failed its live test** and is off,
     so that case isn't covered.
 
