@@ -1577,8 +1577,12 @@ class Monitor:
             log.warning("missed-meal check: ledger fetch failed: %r", exc)
             return
         due_at = time.time() - (now_sec - overdue.seconds_from_midnight)
-        if any(abs(f.get("feed_time", 0) - due_at) < grace + 300 for f in ledger.get("feed_list", [])):
-            return                              # it has a record; other checks own that
+        near = [f for f in ledger.get("feed_list", []) if abs(f.get("feed_time", 0) - due_at) < grace + 300]
+        # Only the meal's own (auto) record counts, failed or not; other checks own failures.
+        # A manual feed near the slot is not the meal (BUGS.md #14: the 11-09 15:55 miss went
+        # unalerted behind a 16:03 manual feed); it only softens the alert to a note.
+        if any(f.get("way") == "auto" for f in near):
+            return
         # A meal we saw preparing or serving (or sent on battery) ran even if its record
         # isn't in yet: on battery the feeder may upload it only at its next wake.
         if self._meal_seen_at(due_at, None) or \
@@ -1588,6 +1592,16 @@ class Monitor:
         if self.store.get_setting(notified_key) == overdue.hhmm:
             return
         self.store.put_setting(notified_key, overdue.hhmm)
+        fed = [f for f in near if f.get("way") != "auto" and (f.get("feed_weight") or 0) > 0]
+        if fed:
+            f = fed[0]
+            when = time.strftime("%H:%M", time.localtime(f["feed_time"]))
+            self.n.fyi(f"{overdue.hhmm} meal didn't run; a manual feed covered it",
+                       f"The feeder never ran its {overdue.hhmm} meal, but a manual feed at {when} "
+                       f"served {f.get('feed_weight')} g food + {f.get('water_weight')} g water. "
+                       f"Nothing to do unless that feed wasn't meant as this meal.")
+            log.info("missed-meal check: %s never ran; manual feed at %s covered it", overdue.hhmm, when)
+            return
         if _on_battery(st):
             self.n.action_needed(
                 f"{overdue.hhmm} meal hasn't run — feeder on battery",

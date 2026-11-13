@@ -64,6 +64,9 @@ and when rather than deleting it.
     ~11 minutes of the slot as that meal's record (how the 11-09 15:55 miss went unalerted).
     The reverse is fixed (2026-11-11): a meal the monitor saw preparing or serving isn't
     reported missed while its ledger record is late (battery meals may upload late).
+    *Fixed 2026-11-12: only the meal's own (auto) record counts; a manual feed near the
+    slot turns the alert into a note ("a manual feed covered it"), and a water-only one
+    doesn't count at all.*
 15. **The water top-up can only add water after serving,** and not once he is eating. By
     design, but a jam-delayed meal can still end up under-soaked.
 16. **The monitor doesn't know firmware 0007's error code 63** ("cat interference –
@@ -71,6 +74,9 @@ and when rather than deleting it.
     *Fixed 2026-11-12: codes 15, 63 and 72 (cat interference) are now named.*
 17. **Deploy drift on the Pi.** ~/riko is an old git checkout updated by copying files, so
     stale files linger (an outdated tests/test_topup.py failed on 11-05).
+    *Fixed 2026-11-12: ~/riko is now a clean checkout of origin/main, updated only by
+    deploy.sh (fetch, run the tests in a scratch worktree, fast-forward if they pass,
+    say whether to restart). ~/riko-stage is retired.*
 18. **The Pi's UPS lasts ~2 hours** and its low-battery safe-idle path has never run on the
     real Pi. The feeder's battery outlasts the Pi.
 19. **The Pi keeps only about a day of system logs** (on 11-11 the oldest monitor entry was

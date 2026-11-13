@@ -17,11 +17,16 @@ Safety caps: one unclog per slot per day, a daily remediation cap, a hard daily
 gram ceiling (won't feed past it — escalates to you instead), refuses to act from an
 unknown state, and a kill-switch file.
 
-## 1. Copy the files
+## 1. Get the code (and update it)
 
-    scp ~/Repos/riko/monitor.py ~/Repos/riko/notify.py yoho@192.168.1.151:~/riko/
+`~/riko` on the Pi is a plain checkout of this repo:
 
-(or add them to your `pushriko` alias' file list)
+    git clone https://github.com/alandyoho/riko-tools.git ~/riko
+
+To update it, push to GitHub, then on the Pi run `~/riko/deploy.sh` (from the Mac:
+`ssh yoho@<pi> riko/deploy.sh`). It fetches origin/main, runs every test in a scratch
+copy, and only if they all pass moves `~/riko` forward; then it says whether the monitor
+needs a restart. Don't copy files over by hand - local edits make it refuse to deploy.
 
 ## 2. Set up phone notifications (ntfy — no account needed)
 

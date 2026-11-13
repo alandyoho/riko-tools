@@ -12,3 +12,5 @@ logs*.txt
 *.bak
 .riko-watch-session.json
 riko_state/
+.env.bak-*
+/monitor.db

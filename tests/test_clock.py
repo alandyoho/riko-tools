@@ -122,4 +122,20 @@ async def main():
     await mon._check_missed_meal(f.status()); await mon._check_missed_meal(f.status())
     assert not f.syncs and notes == [("ACT", "03:55 meal hasn't run")], (f.syncs, notes)
     print("l ok: overdue check ->", notes[0][1], "(once, no sync)")
+
+    # m. BUGS.md #14: a manual feed near the slot is not the meal's record (11-09: 15:55
+    # never ran, a 16:03 manual feed hid it) -> a note, not silence; the meal's own auto
+    # record (even failed) -> nothing here; a water-only manual feed -> still the alert
+    due = real.mktime((2026, 10, 13, 3, 55, 0, 0, 0, -1))
+    rec = lambda dt, way, food: {"feed_time": due + dt, "way": way, "status": 1, "feed_weight": food, "water_weight": 35}
+    for feeds, want in (([rec(480, "manual", 5)], ("FYI", "03:55 meal didn't run; a manual feed covered it")),
+                        ([rec(0, "auto", 0)], None),
+                        ([rec(300, "manual", 0)], ("ACT", "03:55 meal hasn't run"))):
+        at(4, 4); mon, f, notes, _ = make()
+        class L2:
+            async def ledger(self, *a, **k): return {"feed_list": feeds, "eat_list": []}
+        mon.neakasa, mon.device_name = L2(), "dev"
+        await mon._check_missed_meal(f.status())
+        assert notes == ([want] if want else []), (feeds, notes)
+    print("m ok: manual feed near the slot -> note; own auto record -> nothing; water-only -> alert")
 asyncio.run(main())
