@@ -330,10 +330,22 @@ manual feeding will not be available".
   battery to run on its own. **Reading:** not the clock value - 11-09 19:47 woke only 50 s
   off and still skipped. What 11-11 13:47 and tonight share is a sync command right at the
   wake, then the feeder's own meal attempt 29-36 s later; the six skips had nothing sent.
-  So: **a sync at wake seems to make it re-check its schedule.** The monitor's
+  So: **a sync at wake seems to make it re-check its schedule** (disproved at 21:55, below). The monitor's
   `_battery_clock` already syncs once per wake, but only when the clock is off; if this
   holds, sync at every pre-meal wake regardless. Confound: the reboot 35 min before. One
   clean repeat (no reboot, clock near right, sync at wake) would settle it.
+- **2026-11-12 21:55 — the clean repeat (no reboot, kill switch on): it SKIPPED.**
+  Unplugged 21:05:01 (95%), asleep 21:05:40. Woke 21:47:11 IDLE, clock **+43 s**;
+  `updateTime` sent at once, clock after **+42 s** (the sync changed nothing); asleep
+  again 21:47:50, no meal - the usual first-meal skip. Rescued by hand: `siri.sh feed`
+  at 21:54 pressed the SwitchBot, woke it, sent 5 + 35; served 22:00 on battery.
+  **Reading:** the sync command is not what made 19:55 run - there it didn't move the
+  clock either (+21 -> +22 s). What differs is the reboot 35 min before 19:55. The
+  11-11 13:47 sync did move the clock (15 min) and it tried its meal 36 s later.
+  **Hypothesis:** the feeder re-checks its schedule after a reboot or a real clock jump;
+  a sync with nothing to fix does nothing. So "sync at every wake" won't help (not
+  built). What works: the rescue feed at the wake, and the SwitchBot wake + feed after
+  a missed one (first live `siri.sh feed` on battery, 21:54).
 - **2026-11-12 19:56 — SwitchBot wake on battery, live: worked.** `siri.wake` from the Pi
   while asleep: awake (IDLE) 20 s after the command (Bluetooth scan + press + cloud
   report), clock right, asleep again 19:57:07 - **~37 s awake per press**, the same as
