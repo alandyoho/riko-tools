@@ -51,7 +51,15 @@ except ImportError as exc:
 
 APPID  = "32715650"
 SECRET = "698ee0ef531c3df2ddded87563643860"
-BASE   = "https://usapi.neakasapet.com"
+# The feeder-record backend is region-sharded, same as the SDK's login host. Using
+# the wrong host returns code=3018 'UserIdInvalid' — the account is valid, it just
+# doesn't exist on that shard. Pick the host from the account region.
+REGION_HOST = {
+    "US": "https://usapi.neakasapet.com",
+    "EU": "https://euapi.neakasapet.com",
+    "AP": "https://apapi.neakasapet.com",
+}
+BASE   = REGION_HOST["US"]  # default; overridden per-Feeder by region (see __init__)
 UA     = "okhttp/4.12.0"
 FAIL_REASON = {0: "ok", 1: "pump stall (nozzle)", 2: "dispense failure", 5: "grinder"}
 
@@ -77,6 +85,9 @@ class Feeder:
                  region: str = "US", *, client: NeakasaClient | None = None):
         self._owns_client = client is None
         self._c = client or NeakasaClient(email=email, password=password, region=Region[region])
+        if client is not None:  # shared client: take the region from it, not from the default
+            region = getattr(getattr(client, "_region", None), "name", region)
+        self._base = REGION_HOST.get(region, REGION_HOST["US"])
 
     async def __aenter__(self):
         if self._owns_client:
@@ -115,7 +126,7 @@ class Feeder:
         }
 
     async def _get(self, path: str, params: dict) -> dict:
-        url = f"{BASE}{path}?{urllib.parse.urlencode(params)}"
+        url = f"{self._base}{path}?{urllib.parse.urlencode(params)}"
         async with aiohttp.ClientSession() as s:
             async with s.get(url, headers=self._headers(), timeout=20) as r:
                 data = json.loads(await r.text())
@@ -211,26 +222,29 @@ async def _main() -> int:
     ap.add_argument("--owner-id", type=int,
                     help="feeder owner's user_id, if reading as a shared account "
                          "(default: the authenticated account's own id)")
-    ap.add_argument("--region", default="US", choices=["US", "EU", "AP"])
+    ap.add_argument("--region", choices=["US", "EU", "AP"],
+                    help="account region; default: [account] region in config, else US")
     args = ap.parse_args()
 
-    email, pw, owner = args.email, args.password, args.owner_id
+    email, pw, owner, region = args.email, args.password, args.owner_id, args.region
     # default to the main automation [account]; owner id from [feeder] if not passed
     try:
         from config import load as load_config
         cfg = load_config()
         email = email or cfg.email
         pw = pw or cfg.password
+        region = region or getattr(cfg, "region", None)
         if owner is None and cfg.feeder_owner_id:
             owner = cfg.feeder_owner_id
     except Exception:
         pass
+    region = region or "US"
     if not email:
         print("no account email (set [account] or pass --email)", file=sys.stderr); return 2
     if not pw:
         pw = getpass.getpass(f"Neakasa password for {email}: ")
 
-    async with Feeder(email, pw, args.region) as f:
+    async with Feeder(email, pw, region) as f:
         dev = args.device or await f.find_device()
         d = await f.ledger(dev, days=args.days, owner_user_id=owner)
         if args.cmd == "raw":
