@@ -7,8 +7,8 @@ agent (Claude Duet) that reads the series of them and reports on trends.
     daily_report.py --date 2026-11-18 [--print]
 
 Sources: the feeder's history (meals served, eating sessions), its live status (tanks,
-clock), the monitor's database (jams, rescues, top-ups, setting changes) and the push
-log (power and state changes). Read-only: it never changes anything on the feeder.
+clock), the monitor's database (jams, rescues, top-ups, setting changes), the push
+log (power and state changes) and Mr Meow's weigh-ins (cat_weight.py's database). Read-only: it never changes anything on the feeder.
 
 Email: Gmail SMTP with an app password, from the environment (.env):
     RIKO_SMTP_USER       the Gmail address that sends it
@@ -35,6 +35,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from config import load
 from riko import ERROR_CODES, FoodLevel, Riko, Schedule, WaterLevel
+import cat_weight
 
 HERE = Path(__file__).resolve().parent
 PUSHES = HERE / "riko_capture" / "pushes.jsonl"
@@ -189,6 +190,7 @@ async def build(day: str) -> dict:
         },
         "meals": ms,
         "events": {**ev, **monitor_events(day, t0, t1)},
+        "weight": cat_weight.report_section(),
         "feeder_now": {
             "food_tank": st.food_level.name.lower(), "water_tank": st.water_level.name.lower(),
             "power": "battery" if pwr.get("pwrType") == 1 else "mains", "battery_percent": st.battery_pct,
@@ -225,6 +227,13 @@ def render(r: dict) -> str:
     for c in e["setting_changes"]:
         ev.append(f"setting changed at {c['time']}: {c['setting']}")
     lines += [f"  - {x}" for x in ev] or ["  none"]
+    w = r.get("weight")
+    if w:
+        ch = [f"{v:+.1f} lb over {k}" for k, v in (("2 weeks", w["change_2w_lb"]), ("4 weeks", w["change_4w_lb"])) if v is not None]
+        lines += ["", f"Weight: {w['latest_lb']} lb on {w['latest_date']}"
+                      + (f" ({w['days_since']} days ago)" if w["days_since"] > 1 else "")
+                      + (f"; {', '.join(ch)}" if ch else "")
+                      + f"; {w['weigh_ins_30d']} weigh-ins in 30 days, history since {w['first_date']}"]
     clock = f["clock_offset_s"]
     lines += ["", f"Feeder now: food {f['food_tank']}, water {f['water_tank']}, on {f['power']}"
                   + (f" ({f['battery_percent']}%)" if f["power"] == "battery" else "")
