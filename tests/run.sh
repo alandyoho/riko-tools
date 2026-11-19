@@ -30,6 +30,7 @@ run "feeder battery" $PY tests/test_battery.py
 run "siri"           $PY tests/test_siri.py
 run "paused meal"    $PY tests/test_paused.py
 run "busy duplicate" $PY tests/test_busy.py
+run "daily report"   $PY tests/test_report.py
 run "power"         $PY tests/test_power.py $PROPS
 run "failover"      $PY tests/test_failover.py
 run "session"       $PY tests/test_session.py
