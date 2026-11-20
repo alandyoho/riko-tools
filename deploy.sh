@@ -6,7 +6,7 @@
 #   2. check it out in a scratch worktree and run tests/run.sh there, with the
 #      monitor's own .venv and capture files; the live ~/riko isn't touched yet
 #   3. only if every test passes, fast-forward ~/riko to it
-#   4. say whether the monitor needs a restart (it does when a .py it runs changed);
+#   4. say which services need a restart (those whose script or its imports changed);
 #      the restart needs sudo, so it is printed, not run
 #
 # ~/riko must be a clean checkout: local edits to tracked files stop the deploy
@@ -45,9 +45,36 @@ git merge -q --ff-only "$NEW"
 echo "~/riko now at $(git log --oneline -1)"
 changed=$(git diff --name-only "$OLD" "$NEW")
 echo "$changed" | sed 's/^/  changed: /'
-if echo "$changed" | grep -E '^[^/]+\.py$' | grep -qvx 'siri.py'; then   # siri.py runs fresh each time
-    echo "Python files changed - restart the monitor to load them:"
-    echo "  ssh -t yoho@$(hostname -I | awk '{print $1}') 'sudo systemctl restart riko-monitor'"
+# Which running services load a changed file: each riko-*.service's script plus every
+# local module it imports, followed through. Scripts run fresh each time (siri.py,
+# daily_report.py, cat_weight.py from cron or the phone) never need a restart.
+services=$(for f in /etc/systemd/system/riko-*.service; do
+    [[ -e $f ]] || continue
+    script=$(grep -o 'python3 [A-Za-z0-9_]*\.py' "$f" | head -1 | cut -d' ' -f2)
+    [[ -n $script ]] && echo "$(basename "$f" .service) $script"
+done)
+restart=$(echo "$changed" | .venv/bin/python3 -c '
+import ast, sys
+from pathlib import Path
+changed = {l.strip() for l in sys.stdin if l.strip().endswith(".py") and "/" not in l.strip()}
+def local_imports(path, seen):
+    if path in seen or not Path(path).exists():
+        return seen
+    seen.add(path)
+    for node in ast.walk(ast.parse(Path(path).read_text())):
+        names = [a.name for a in node.names] if isinstance(node, ast.Import) else \
+                [node.module] if isinstance(node, ast.ImportFrom) and node.module and not node.level else []
+        for n in names:
+            local_imports(n.split(".")[0] + ".py", seen)
+    return seen
+for line in sys.argv[1].splitlines():
+    unit, script = line.split()
+    if changed & local_imports(script, set()):
+        print(unit)
+' "$services")
+if [[ -n $restart ]]; then
+    echo "these services run changed code - restart them to load it:"
+    echo "  ssh -t yoho@$(hostname -I | awk '{print $1}') 'sudo systemctl restart $(echo $restart)'"
 else
-    echo "no Python changes - no restart needed"
+    echo "no running service uses the changed files - no restart needed"
 fi
