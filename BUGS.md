@@ -8,17 +8,33 @@ and when rather than deleting it.
 
 ## Feeder firmware (1.0.1-0007) — we can only work around these
 
-1. **It skips the first scheduled meal after switching to battery.** 6 of 6 since
-   September (09-09, 09-10, 09-16, 09-26, 11-09 15:55 and 19:55). It wakes ~7 minutes
-   before the slot, reports IDLE for 23-59 s, and sleeps again. No ledger record at all,
-   not even a failure. The second meal ran both times we tried (11-09 17:55, 21:55), but
-   only after it had been woken and fed by hand in between. Any power cut costs at least
-   one meal, silently. Likely cause (11-11): it wakes at the right real time, but its
-   clock is wrong after sleep (80 min fast, 15 min slow), so the meal isn't "now"; synced,
-   it tried the meal by itself within 36 s.
-2. **Its clock is unreliable across power changes.** Jumped 80 min ahead once on battery
-   (11-09); gains ~1 min/hour asleep on battery; lost 20-30 min after short unplugs in
-   Sept/Oct and never corrected itself. A wrong clock shifts every meal; a jump can skip one.
+1. **It skips the first scheduled meal after switching to battery.** Left alone, it has
+   skipped 7 of 8 first meals since September (09-09, 09-10, 09-16, 09-26, 11-09 15:55 and
+   19:55, 11-12 21:55). Each time it wakes 7-8 minutes before the slot, reports IDLE for
+   ~25-60 s and sleeps again, with no ledger record at all, not even a failure. Later
+   meals on battery do run on their own (11-09 17:55 and 21:55).
+   *Cause still unknown.* Ruled out: a wrong clock alone (11-09 19:47 woke 50 s off and
+   skipped) and a clock sync at the wake (11-12 21:55: synced at once, still skipped).
+   The two first meals it did attempt itself both followed something bigger: a reboot
+   35 min earlier (11-12 19:55, ran on time) and a real 15-minute clock correction at the
+   wake (11-11 13:55, tried 36 s later). Current hypothesis: it re-reads its schedule only
+   after a reboot or a real clock jump. Untested: a cut that starts during the 10-minute
+   prep, or within a few minutes of the slot.
+   *Worked around (monitor):* the rescue feed at the wake (proven live 11-11 13:55), and
+   the SwitchBot press at slot + 1 min when the meal is still owed and the feeder is asleep
+   (wake proven live 11-12; on since then, RIKO_SWITCHBOT=on). A meal is never doubled up:
+   the feeder's own late attempt is refused "busy" and logged as a duplicate (#13).
+   Details: TESTS.md, Answered, "Does the feeder work on battery?".
+2. **Its clock is unreliable across power changes.** On battery it gains ~1 min per hour
+   asleep (+101 s and +107 s after ~1 h 40 m on 11-09) and once jumped 80 min ahead
+   (11-09 15:47); another wake read 15 min slow (11-11 13:47). Short unplugs in Sept/Oct
+   left it 20-30 min slow, and it never corrected itself. Back on wall power it holds
+   time well. A wrong clock shifts every meal, and a jump past a slot loses that meal.
+   Not the cause of the first-meal skip on its own (#1).
+   *Worked around (monitor):* the clock keeper syncs it when it drifts on wall power
+   without repeating a meal (#11), and on battery the clock is checked at the switch and
+   at every wake (`_battery_clock`), synced only when it is actually off - a sync with
+   nothing to fix does nothing (11-12 21:55).
 3. **Grinder jams (code 13) never clear by themselves.** After 10 minutes it gives up and
    serves a partial meal. Pause + resume does not clear one (0 of 10, 11-05), and each
    resume restarts the 10-minute timer. Mostly the duck food (~2.7 a day; chicken none).
