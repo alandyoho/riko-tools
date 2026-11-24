@@ -36,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from config import load
 from riko import ERROR_CODES, FoodLevel, Riko, Schedule, WaterLevel
 import cat_weight
+import topup
 
 HERE = Path(__file__).resolve().parent
 PUSHES = HERE / "riko_capture" / "pushes.jsonl"
@@ -65,13 +66,18 @@ def meals(led: dict, t0: float, t1: float) -> list[dict]:
         ft = f["feed_time"]
         nxt = next((g["feed_time"] for g in every if g["feed_time"] > ft), ft + 4 * 3600)
         mine = [e for e in eats if ft <= (e.get("start_time") or 0) < nxt]
+        suspect = topup.implausible_record(f) if f.get("status") == 1 else ""
         served = (f.get("feed_weight") or 0) + (f.get("water_weight") or 0)
+        if suspect:      # a misweigh: judge "finished" against what was planned instead
+            served = (f.get("plan_feed_weight") or 0) + (f.get("plan_water_weight") or 0)
         eaten = sum(e.get("eat_weight") or 0 for e in mine)
         m = {"time": hm(ft), "kind": "scheduled" if f.get("way") == "auto" else "manual",
              "ok": f.get("status") == 1, "food_g": f.get("feed_weight") or 0,
              "water_g": f.get("water_weight") or 0, "planned_food_g": f.get("plan_feed_weight") or 0,
              "eaten_g": eaten, "finished": bool(served) and eaten >= 0.8 * served,
              "first_bite_min": round(((mine[0].get("start_time") or ft) - ft) / 60) if mine else None}
+        if suspect:
+            m["record_suspect"] = suspect
         if not m["ok"]:
             try:
                 from monitor import decode_fail_reason
@@ -171,9 +177,10 @@ async def build(day: str) -> dict:
     ms = meals(led, t0, t1)
     sched = Schedule.from_status(st)
     planned = sum(sl.food_g for sl in sched.slots if sl.enabled) if sched else None
-    served_food = sum(m["food_g"] for m in ms if m["ok"])
-    served_total = sum(m["food_g"] + m["water_g"] for m in ms if m["ok"])
-    eaten = sum(m["eaten_g"] for m in ms)
+    good = [m for m in ms if m["ok"] and not m.get("record_suspect")]   # misweighed records left out
+    served_food = sum(m["food_g"] for m in good)
+    served_total = sum(m["food_g"] + m["water_g"] for m in good)
+    eaten = sum(m["eaten_g"] for m in ms if not m.get("record_suspect"))   # same meals as served_total
     ev = power_and_stops(t0, t1)
     pwr = st._p("pwrStatus", {}) or {}
     return {
@@ -182,6 +189,7 @@ async def build(day: str) -> dict:
             "meals_served": sum(m["ok"] for m in ms), "meals_failed": sum(not m["ok"] for m in ms),
             "manual_feeds": sum(m["kind"] == "manual" and m["ok"] for m in ms),
             "scheduled_with_no_record": missed(st, ms, day),
+            "records_suspect": [m["time"] for m in ms if m.get("record_suspect")],
             "food_served_g": served_food, "food_planned_g": planned,
             "served_total_g": served_total, "eaten_total_g": eaten,
             "eaten_share": round(eaten / served_total, 2) if served_total else None,
@@ -205,7 +213,9 @@ def render(r: dict) -> str:
     lines.append(f"Meals: {s['meals_served']} served, {s['meals_failed']} failed"
                  + (f", {s['manual_feeds']} manual" if s["manual_feeds"] else "")
                  + (f"; no record for {', '.join(s['scheduled_with_no_record'])}" if s["scheduled_with_no_record"] else ""))
-    lines.append(f"Food: {s['food_served_g']:g} g served (schedule: {s['food_planned_g']:g} g)")
+    sus = s.get("records_suspect") or []
+    lines.append(f"Food: {s['food_served_g']:g} g served (schedule: {s['food_planned_g']:g} g)"
+                 + (f"; not counting the {', '.join(sus)} meal{'s' if len(sus) > 1 else ''}, whose record is a misweigh" if sus else ""))
     if s["served_total_g"]:
         lines.append(f"Eaten: {s['eaten_total_g']} g of {s['served_total_g']} g served ({s['eaten_share']:.0%}, food + water); "
                      f"{s['meals_finished']} meals finished, {s['meals_untouched']} untouched")
@@ -213,6 +223,8 @@ def render(r: dict) -> str:
     for m in r["meals"]:
         tail = (f"FAILED: {m.get('failed_because')}" if not m["ok"] else
                 f"ate {m['eaten_g']} g" + (f", first bite after {m['first_bite_min']} min" if m["first_bite_min"] is not None else ", not touched"))
+        if m.get("record_suspect"):
+            tail += f"  [RECORD WRONG: {m['record_suspect']}; not real, left out of the totals]"
         lines.append(f"  {m['time']} {m['kind']:<9} {m['food_g']} g / {m['water_g']} g  {tail}")
     lines += ["", "Events:"]
     ev = []

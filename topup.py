@@ -120,6 +120,23 @@ def unexplained_extra(ledger: dict[str, Any], feed: dict[str, Any]) -> tuple[flo
     return after - served - before.grams, before.grams, before.last_feed_at
 
 
+def implausible_record(feed: dict[str, Any]) -> str:
+    """Why a served meal's recorded weights can't be real, or "".
+
+    The feeder weighs what it dispenses with the bowl scale, so anything pressing on the
+    bowl mid-meal is counted. On 2026-11-24 07:55 he interfered while it dispensed food
+    (code 15) and it recorded 192 g food + 7 g water for a 5 + 35 g meal; the bowl held
+    12 g after serving. Normal meals land within a few grams of the plan, so more than
+    3x the plan (plus a little slack for tiny portions) is a misweigh, not a meal."""
+    food, water = feed.get("feed_weight") or 0, feed.get("water_weight") or 0
+    plan_food, plan_water = feed.get("plan_feed_weight") or 0, feed.get("plan_water_weight") or 0
+    water_off = "plan_water_weight" in feed and water > 3 * plan_water + 15
+    if food > 3 * plan_food + 3 or water_off:
+        return (f"the feeder recorded {food:g} g food + {water:g} g water for a "
+                f"{plan_food:g} + {plan_water:g} g meal")
+    return ""
+
+
 @dataclass(frozen=True)
 class Plan:
     action: str        # "full" (serve the meal as scheduled), "topup", or "skip"

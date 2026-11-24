@@ -74,6 +74,13 @@ async def main():
         assert feeds == [] and len(notes) == 1 and why in notes[0][2] and "14 g would make it up" in notes[0][2], (kw, st_kw, notes)
     print("3 ok: held off when too late, a meal is due, kill switch, policy off, feeder busy, bowl off")
 
+    # 4a. the 2026-11-24 07:55 misweigh: 192 g food + 7 g water recorded for 5 + 35 -> no water, one note
+    mon, notes, feeds = make(192, 7)
+    await mon.check_ledger_failures(status(plan=far()))
+    await mon.check_ledger_failures(status(plan=far()))
+    assert feeds == [] and len(notes) == 1 and "looks wrong" in notes[0][1] and "192 g food" in notes[0][2], notes
+    print("4a ok: a misweighed record gets a note, not a water top-up")
+
     # 4. capped at 60 g
     mon, notes, feeds = make(10, 0, plan=(10, 80))
     await mon.check_ledger_failures(status(plan=far()))

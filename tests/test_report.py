@@ -8,7 +8,7 @@ T = lambda h, m: time.mktime((2026, 11, 18, h, m, 0, 0, 0, -1))
 t0, t1 = D.day_bounds("2026-11-18")
 feed = lambda h, m, food, water, ok=True, way="auto": {
     "feed_time": T(h, m), "way": way, "status": 1 if ok else 2, "feed_weight": food if ok else 0,
-    "water_weight": water if ok else 0, "plan_feed_weight": food,
+    "water_weight": water if ok else 0, "plan_feed_weight": food, "plan_water_weight": water,
     "fail_reason": "" if ok else json.dumps({"reason": 2, "resParam": 13})}
 eat = lambda h, m, g, mins=5: {"start_time": T(h, m), "end_time": T(h, m) + mins * 60, "eat_weight": g}
 led = {"feed_list": [feed(9, 55, 5, 35), feed(11, 55, 5, 35), feed(13, 55, 4, 28, ok=False), feed(15, 55, 5, 35)],
@@ -33,3 +33,15 @@ assert "schedule: 46 g" in text and "no record for 03:55" in text and "on batter
 assert "11:55 scheduled 5 g / 35 g  ate 0 g, not touched" in text, text
 assert json.loads(text.split("DATA (JSON, same numbers):\n")[1]) == rep
 print("ok: report text has the summary, each meal, the events, and a JSON block that round-trips")
+
+import topup
+odd = dict(feed(7, 55, 5, 35), feed_weight=192, water_weight=7)
+assert topup.implausible_record(odd) and not topup.implausible_record(feed(9, 55, 5, 35))
+assert not topup.implausible_record(dict(feed(9, 55, 5, 35), feed_weight=8, water_weight=40))
+assert not topup.implausible_record(dict(feed(9, 55, 0, 60), feed_weight=0, water_weight=60))
+m2 = D.meals({"feed_list": [odd], "eat_list": [eat(7, 56, 10)]}, t0, t1)[0]
+assert m2["record_suspect"] and "192 g food" in m2["record_suspect"] and not m2["finished"], m2
+rep2 = dict(rep, meals=[m2], summary=dict(rep["summary"], records_suspect=["07:55"]))
+t2 = D.render(rep2)
+assert "not counting the 07:55 meal, whose record is a misweigh" in t2 and "RECORD WRONG" in t2, t2
+print("ok: a misweighed meal (192 g recorded for 5 g) is flagged and kept out of the served totals")

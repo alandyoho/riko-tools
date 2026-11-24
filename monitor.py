@@ -1323,11 +1323,22 @@ class Monitor:
         plan_food, plan_water = feed.get("plan_feed_weight") or 0, feed.get("plan_water_weight") or 0
         if food <= 0 or plan_food <= 0 or plan_water <= 0:
             return                                    # water-only feeds (including ours)
+        when = time.strftime("%H:%M", time.localtime(feed["feed_time"]))
+        bad = topup.implausible_record(feed)
+        if bad:                                       # a misweigh: the water owed would be nonsense
+            key = f"water {feed['feed_time']}"
+            if self.store.get_setting("water_topup_last") != key:
+                self.store.put_setting("water_topup_last", key)
+                log.warning("meal %s: %s - not trusting it; no water top-up", when, bad)
+                self.n.fyi(f"{when} meal: the feeder's record looks wrong",
+                           f"{bad[0].upper()}{bad[1:]}, more than it can serve - most likely a misweigh "
+                           f"(something pressing on the bowl while it dispensed). No water was added. "
+                           f"Check the bowl if you can.")
+            return
         owed = round(food * plan_water / plan_food - water)
         if owed < self.p.water_topup_min_g:
             return
         owed = min(owed, int(self.p.water_topup_max_g))
-        when = time.strftime("%H:%M", time.localtime(feed["feed_time"]))
         served = f"{food:g} g food + {water:g} g water (planned {plan_food:g} + {plan_water:g})"
         key = f"water {feed['feed_time']}"
         if self.store.get_setting("water_topup_last") == key:
