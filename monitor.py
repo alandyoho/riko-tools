@@ -157,6 +157,13 @@ class Policy:
     water_topup_max_g: float = 60.0
     water_topup_window_min: float = 30.0    # only for a meal served this recently
     water_topup_eaten_g: float = 3.0        # bowl this far under what was served = he has started eating
+    # nudge: a meal still untouched this long after serving gets a double ping from the
+    # feeder (any settings write pings; two writes 2 s apart = two pings, 2026-11-25)
+    nudge: bool = True
+    nudge_after_min: tuple[float, ...] = (10.0, 25.0)   # one nudge at each, while untouched
+    nudge_outcome_min: float = 35.0         # last look: did he come after the nudges?
+    nudge_pings: int = 2
+    nudge_gap_s: float = 2.0                # writes closer than ~1 s merge into one ping
     max_unjam_per_slot: int = 2             # tries per meal; after that, it's the owner's
     max_bowl_tare_fixes_per_day: int = 10  # beyond this, stop auto-fixing and escalate
     missed_feed_grace_min: float = 6.0      # minutes past the expected serve before "missed"
@@ -432,6 +439,10 @@ class Monitor:
         if self.neakasa is not None:
             await self.check_ledger_failures(st)
             await self._check_topup(st)
+        try:
+            await self._check_nudge(st)
+        except Exception as exc:
+            log.warning("nudge check failed: %r", exc)
 
     # ---- top-up: shrink the next meal by what is still in the bowl ---------------
     def _topup_pending(self) -> dict | None:
@@ -1235,6 +1246,7 @@ class Monitor:
                 await self._check_water_short(st, f)
             except Exception as exc:
                 log.warning("water top-up check failed: %r", exc)
+            self._nudge_arm(f)
             if f.get("status") == 1:
                 continue  # succeeded
             reason_str = decode_fail_reason(f.get("fail_reason", ""))
@@ -1376,6 +1388,80 @@ class Monitor:
         self.n.fyi(f"Added {owed} g of water to the {when} meal",
                    f"It was served {served}, so its food didn't get all its water. "
                    f"A water-only feed of {owed} g is on its way (no soak, under a minute).")
+
+    # ---- nudge: ping when a meal sits untouched -----------------------------------
+    def _nudge_arm(self, feed: dict) -> None:
+        """A meal was just served: watch whether he comes to it (see _check_nudge)."""
+        food, left = feed.get("feed_weight") or 0, feed.get("left_weight") or 0
+        if feed.get("status") != 1 or food <= 0 or left <= 0 or topup.implausible_record(feed):
+            return                     # failed, water-only, no bowl reading, or a misweigh
+        if time.time() - feed.get("feed_time", 0) > self.p.nudge_outcome_min * 60:
+            return
+        self.store.put_setting("nudge_pending", json.dumps(
+            {"feed_time": int(feed["feed_time"]), "left": float(left), "done": 0, "nudged": []}))
+
+    async def _ping(self, st: RikoStatus) -> None:
+        """Make the feeder ping without changing anything: rewrite child lock with the
+        value it already has. One ping per write, if they are at least ~1 s apart."""
+        value = st._p("childLockOnOff", 0)   # noqa: SLF001
+        for i in range(self.p.nudge_pings):
+            if i:
+                await self._sleep(self.p.nudge_gap_s)
+            await self.r.set_property("childLockOnOff", value)
+
+    async def _check_nudge(self, st: RikoStatus) -> None:
+        """If a meal is still untouched nudge_after_min after serving, ping the feeder
+        (a double ping), at most once per entry in nudge_after_min. A last look at
+        nudge_outcome_min records whether he came. "Untouched" = the live bowl is no
+        more than water_topup_eaten_g under what was in it after serving. Gives up on
+        the meal if the bowl is off, the feeder is busy or asleep (battery), or he ate."""
+        raw = self.store.get_setting("nudge_pending")
+        if not raw:
+            return
+        try:
+            pend = json.loads(raw)
+        except ValueError:
+            self.store.put_setting("nudge_pending", "")
+            return
+        marks = list(self.p.nudge_after_min) + [self.p.nudge_outcome_min]
+        done = int(pend.get("done", 0))
+        age = time.time() - pend["feed_time"]
+        if done >= len(marks) or age < marks[done] * 60:
+            return
+        while done + 1 < len(marks) and age >= marks[done + 1] * 60:
+            done += 1                    # missed a mark (monitor down): skip to the latest
+        when = time.strftime("%H:%M", time.localtime(pend["feed_time"]))
+        nudged = pend.get("nudged", [])
+
+        def finish(result: str | None) -> None:
+            self.store.put_setting("nudge_pending", "")
+            if result and nudged:
+                self.store.record_remediation(when, "nudge result", result)
+            if result:
+                log.info("nudge %s: %s", when, result)
+
+        if _on_battery(st) or st.state != FeederState.IDLE or not st.bowl_in:
+            return finish("stopped watching: the feeder is asleep, busy or the bowl is off")
+        bowl = await self._bowl_now()
+        if bowl is None:
+            return finish("stopped watching: the bowl couldn't be weighed")
+        mins = round(age / 60)
+        if bowl < pend["left"] - self.p.water_topup_eaten_g:
+            after = f" after {len(nudged)} nudge(s)" if nudged else ", no nudge needed"
+            return finish(f"he came{after}: {bowl:.0f} g of {pend['left']:g} g left at {mins} min")
+        if done == len(marks) - 1:
+            return finish(f"still untouched at {mins} min ({bowl:.0f} g of {pend['left']:g} g), "
+                          f"after {len(nudged)} nudge(s)")
+        pend["done"] = done + 1
+        if not self.p.nudge or self.dry_run or self.p.killswitch.exists():
+            log.info("nudge %s: untouched at %d min (%.0f g); nudge is off, not pinging", when, mins, bowl)
+        else:
+            await self._ping(st)
+            nudged.append(mins)
+            pend["nudged"] = nudged
+            self.store.record_remediation(when, "nudge", f"untouched at {mins} min ({bowl:.0f} g): pinged x{self.p.nudge_pings}")
+            log.info("nudge %s: untouched at %d min (%.0f g of %g g) - pinged", when, mins, bowl, pend["left"])
+        self.store.put_setting("nudge_pending", json.dumps(pend))
 
     def _check_overdispense(self, ledger: dict, feed: dict) -> None:
         """Alert when a meal leaves more in the bowl than the leftover plus what the
@@ -2039,6 +2125,7 @@ async def main() -> int:
     policy = Policy(killswitch=cfg.state_dir / "DISABLE_REMEDIATION",
                     topup_mode=os.environ.get("RIKO_TOPUP", "observe").lower(),
                     switchbot=os.environ.get("RIKO_SWITCHBOT", "off").lower() == "on",
+                    nudge=os.environ.get("RIKO_NUDGE", "on").lower() != "off",
                     switchbot_mac=os.environ.get("RIKO_SWITCHBOT_MAC", ""))
 
     async with Riko.from_config(cfg) as r:

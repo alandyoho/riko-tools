@@ -335,6 +335,15 @@ grinder jam.
   for the Bot at 20%. A press wakes a sleeping feeder without feeding; on mains it only
   beeps. Off unless `RIKO_SWITCHBOT=on` and `RIKO_SWITCHBOT_MAC` are set in `.env`.
 
+- **A meal left untouched gets a nudge.** Any settings write makes the feeder ping, even
+  one that changes nothing; writes 2 s apart ping separately, writes within a second
+  merge into one (2026-11-25). If the live scale shows a served meal untouched (no more
+  than 3 g gone) 10 minutes after serving, the monitor rewrites child lock with its
+  current value twice, 2 s apart: a double ping. Again at 25 minutes if still untouched,
+  then a last look at 35 minutes records whether he came (`nudge` / `nudge result` in the
+  daily report). Never on battery (asleep), with the bowl off, the feeder busy, or a
+  misweighed record. `RIKO_NUDGE=off` in `.env` turns it off.
+
 Every jam is logged (table `jams` in `monitor.db`): the bowl's weight while stuck and
 how it ended — cleared by the monitor, cleared by hand, or timed out. Other grinder
 faults (head missing, motor stalled) are never retried.

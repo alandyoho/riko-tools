@@ -26,6 +26,7 @@ run "over-dispense" $PY tests/test_overdispense.py $LEDGER
 run "clock"         $PY tests/test_clock.py
 run "grinder jam"   $PY tests/test_jam.py
 run "water top-up"  $PY tests/test_water.py
+run "nudge"          $PY tests/test_nudge.py
 run "feeder battery" $PY tests/test_battery.py
 run "siri"           $PY tests/test_siri.py
 run "paused meal"    $PY tests/test_paused.py
